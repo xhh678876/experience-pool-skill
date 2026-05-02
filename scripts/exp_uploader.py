@@ -1485,6 +1485,117 @@ def session_to_segments(session: Session, **kwargs: Any) -> list[Session]:
 # Lite-card builder (matches cli/src/lite.ts shape).
 # ---------------------------------------------------------------------------
 
+_INTENT_SYSTEM = """You are a task-labeling tool. You receive a TRANSCRIPT of a past
+conversation between a user and an AI agent, and you output a one-line label
+that names the task the user was working on.
+
+CRITICAL — you are NOT continuing the conversation. You are NOT a participant.
+You are a labeler. You read the transcript from the outside.
+
+Output rules (strict):
+- Exactly ONE line, no preamble, no quotes, no trailing punctuation
+- Maximum 80 characters
+- Action-oriented: a verb phrase or noun-of-action (e.g. "Debug FastAPI HMAC
+  signature mismatch", "上传 PDF 作业并生成解题大纲", "Plan Lobster Square
+  building takeover")
+- Match the language the user predominantly used in the transcript
+- Do NOT echo the user's literal first message
+- Do NOT include role labels, emojis, "the user wants to", "task:", etc.
+- If the transcript is purely a greeting / acknowledgment / has no real task,
+  output exactly: (no task)
+
+Examples:
+
+TRANSCRIPT:
+[user] csv revenue 按区域汇总然后按 quarter 排序
+[assistant] 我用 pandas...
+LABEL: 按区域汇总 CSV 营收并按季度排序
+
+TRANSCRIPT:
+[user] hi there
+[assistant] hello! how can i help?
+LABEL: (no task)
+
+TRANSCRIPT:
+[user] 我的 Caddy 拿不到 cert，报 acme challenge 失败
+[assistant] 检查 80 端口是否开放...
+LABEL: 排查 Caddy Let's Encrypt ACME 证书签发失败
+
+Now do the same for the transcript that follows."""
+
+
+def _format_for_intent(turns: list[Turn], max_chars: int = 4000) -> str:
+    """Compact representation for the labeler. Use bracketed role tags so the
+    model treats it as data, not as a live conversation it should respond to."""
+    if not turns:
+        return ""
+    user_turns = [t for t in turns if t.role == "user"]
+    asst_turns = [t for t in turns if t.role == "assistant"]
+    picks: list[tuple[str, str]] = []
+    if user_turns:
+        picks.append(("user", user_turns[0].content or ""))
+    if asst_turns:
+        picks.append(("assistant", asst_turns[0].content or ""))
+    if len(asst_turns) > 1 and asst_turns[-1] is not asst_turns[0]:
+        picks.append(("assistant", asst_turns[-1].content or ""))
+    chunks: list[str] = []
+    budget_per = max(200, max_chars // max(1, len(picks)))
+    for role, content in picks:
+        chunks.append(f"[{role}] {content[:budget_per]}")
+    return "TRANSCRIPT:\n" + "\n".join(chunks) + "\nLABEL:"
+
+
+def summarize_intent(turns: list[Turn], *,
+                     backend_kind: str = "auto",
+                     model: str | None = None,
+                     verbose: bool = False) -> str | None:
+    """One-shot LLM call → concise task summary. Returns None if no backend."""
+    try:
+        here = Path(__file__).parent
+        sys.path.insert(0, str(here))
+        from exp_annotator import pick_backend  # type: ignore
+    except ImportError:
+        return None
+    try:
+        backend = pick_backend(backend_kind, model)
+    except SystemExit:
+        return None
+    user_block = _format_for_intent(turns)
+    if not user_block.strip():
+        return None
+    try:
+        raw = backend.call(_INTENT_SYSTEM, user_block)
+    except Exception as e:
+        if verbose:
+            print(f"[intent] summarizer failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    if not raw:
+        return None
+    # Take the FIRST non-empty line that looks like a label, strip artifacts.
+    for line in raw.splitlines():
+        cand = line.strip().strip('"').strip("'").strip("「」")
+        # Drop common preamble forms ("Label:", "标签:", "Task:")
+        for prefix in ("LABEL:", "Label:", "label:", "TASK:", "Task:", "task:",
+                       "标签:", "标签：", "任务:", "任务："):
+            if cand.startswith(prefix):
+                cand = cand[len(prefix):].strip()
+        if not cand:
+            continue
+        cand = cand.rstrip(".。 ")
+        # Skip if it's the model continuing the conversation (look for
+        # red-flag phrases that mean "model is responding, not labeling")
+        lowered = cand.lower()
+        if any(bad in lowered for bad in ("我在的", "i'm here", "hello", "hi there",
+                                          "抱歉", "不行。", "ok, i'll", "好的，我")):
+            return None
+        if cand == "(no task)" or cand.lower() == "(no task)":
+            return None
+        if len(cand) > 120:
+            cand = cand[:117].rstrip() + "…"
+        return cand
+    return None
+
+
 def build_lite_card(
     session: Session,
     *,
@@ -1492,6 +1603,10 @@ def build_lite_card(
     sensitivity: str,
     acl: str,
     tags: list[str],
+    summarize: bool = False,
+    summarizer_backend: str = "auto",
+    summarizer_model: str | None = None,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     query = ""
     steps: list[str] = []
@@ -1516,7 +1631,17 @@ def build_lite_card(
             steps.append(body[:280])
             outcome = body
 
-    intent = (query[:120] or "unspecified task").strip()
+    # Intent: by default, an LLM-generated task summary; falls back to the
+    # truncated first-user-turn when the summarizer isn't available.
+    summary_intent: str | None = None
+    if summarize:
+        summary_intent = summarize_intent(
+            session.trajectory,
+            backend_kind=summarizer_backend,
+            model=summarizer_model,
+            verbose=verbose,
+        )
+    intent = summary_intent or (query[:120] or "unspecified task").strip()
     return {
         "card": {
             "query": query or "(no user turn)",
@@ -1739,12 +1864,17 @@ def _push_one(session: Session, args: argparse.Namespace,
     rewards = _maybe_annotate(session, args)
     if rewards is not None:
         session.extra["rewards"] = rewards
+    summarize_flag = not getattr(args, "no_summarize_intent", False)
     parts = build_lite_card(
         session,
         task_type=args.task,
         sensitivity=args.sensitivity,
         acl=args.acl,
         tags=args.tag or [],
+        summarize=summarize_flag,
+        summarizer_backend=getattr(args, "summarizer_backend", "auto"),
+        summarizer_model=getattr(args, "summarizer_model", None),
+        verbose=getattr(args, "verbose", False),
     )
     body: dict[str, Any] = {
         **parts["card"],
@@ -1994,6 +2124,9 @@ def cmd_daemon_tick(args: argparse.Namespace) -> int:
         no_segment_keyword=False,
         segment_time_gap_min=int(os.environ.get("EXP_SEGMENT_TIME_GAP_MIN", "30")),
         segment_max_turns=int(os.environ.get("EXP_SEGMENT_MAX_TURNS", "60")),
+        no_summarize_intent=os.environ.get("EXP_AUTO_SUMMARIZE_INTENT", "1").lower() in {"0", "false", "no"},
+        summarizer_backend="auto",
+        summarizer_model=None,
         verbose=args.verbose,
     )
     for src in enabled:
@@ -2170,6 +2303,13 @@ def build_parser() -> argparse.ArgumentParser:
                            help="cap evaluated turns per session (cost control)")
     push_args.add_argument("--annotate-pick", default="even",
                            choices=["first", "even", "important"])
+    push_args.add_argument("--no-summarize-intent", action="store_true",
+                           help="skip LLM-generated task summary; use literal "
+                                "first user turn as intent (fallback behavior)")
+    push_args.add_argument("--summarizer-backend", default="auto",
+                           choices=["auto", "claude", "anthropic", "openai"])
+    push_args.add_argument("--summarizer-model", default=None,
+                           help="model id for intent summarization (default haiku)")
     push_args.add_argument("--no-segment", action="store_true",
                            help="upload the whole session as one experience "
                                 "(default is to segment by topic shifts / time gaps)")
