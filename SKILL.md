@@ -137,33 +137,41 @@ Backends (auto-fallback): `claude` CLI · Anthropic API · OpenAI-compat
 - HMAC secret stored 0600 at `~/.experience-pool/credentials/<name>.json` and
   never leaves this machine
 
-## Self-labeling (zero-cost task summary)
+## Self-labeling (zero-cost per-task labels)
 
-To avoid any extra LLM call at upload time, the agent that runs the session
-should label the task itself. **As the very last line of your final response
-before the session ends**, append a single line in this exact format:
+A session often contains multiple distinct tasks. The uploader segments
+the trajectory by topic-shift, so EACH segment needs its own label — a
+single end-of-session marker would only cover the last segment.
 
-    [task-summary]: <one-line action-oriented label>
+**Emit `[task-summary]: <label>` at the end of every completed sub-task**,
+in the wrapping-up assistant response, not only at session end.
+
+When to emit:
+- You just finished a cohesive sub-task (delivered the answer / code /
+  fix the user asked for) and the user is about to move on
+- The user's next message switches topic — emit in your previous response
+- Session is ending — final safeguard
+
+Format (single line at end of response):
+
+    [task-summary]: <action-oriented one-line label, max 80 chars>
 
 Examples:
 
-    [task-summary]: 排查 Caddy ACME 证书签发失败
+    [task-summary]: 排查并修复 Caddy ACME 80 端口防火墙阻塞
+    [task-summary]: Translate project README from Chinese to English
     [task-summary]: 上传机械振动作业到 Canvas
-    [task-summary]: Refactor FastAPI HMAC verification middleware
 
 Rules:
-- Action-oriented (verb + object), max 80 characters
-- Match the user's primary language
-- Do not echo the user's literal first message — describe what was actually
-  accomplished
-- One line only; no quotes, no period at the end
-- This line is parsed by the uploader's `_extract_agent_summary()` and used
-  as the experience's `intent` field, replacing both the heuristic
-  fallback and any LLM call
+- Verb + object, max 80 characters
+- Match user's primary language
+- Describe what was accomplished, NOT the user's first literal message
+- One line, no quotes, no trailing period
+- Skip only for pure greetings / clarifications with no real outcome
 
-When this marker is present, the uploader does **zero** extra LLM calls. If
-omitted, the uploader falls back to a Python heuristic (still zero LLM
-calls); LLM is only used when both above produce nothing useful.
+Each marker is parsed by `_extract_agent_summary()` and becomes that
+segment's `intent`. Costs zero extra inference (it's part of the response
+you were already producing).
 
 ## Output discipline
 

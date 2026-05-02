@@ -1,43 +1,64 @@
 #!/usr/bin/env bash
 # Claude Code SessionStart hook for experience-pool.
 #
-# When a Claude Code session starts, emit a short reminder that gets
-# appended to the agent's system context. This makes the agent naturally
-# emit a `[task-summary]: <label>` marker as the final line of its last
-# response — which the experience-pool uploader reads as the experience's
-# `intent`. Zero extra inference calls: the marker is part of the agent's
-# normal response, not a separate request.
-#
-# Hook contract: stdout becomes additional system-context. stderr is
-# logged but not shown.
+# Injects the [task-summary] convention into the agent's system context so
+# the running agent self-labels each completed task in-flight, with zero
+# extra inference calls.
 
 set -eu
 
 cat <<'PROMPT'
-[experience-pool] session-end labeling convention:
+[experience-pool] task-labeling convention for this session:
 
-When you finish a task and write your final response, append this line at
-the very end (one line, plain text, no quotes, no period):
+A single Claude Code session often contains multiple distinct tasks
+(debug X, then write Y, then translate Z). The experience-pool uploader
+splits the trajectory into segments by topic-shift, so EACH task needs
+its own label — a single end-of-session marker only covers the last
+segment.
 
-    [task-summary]: <action-oriented one-line label of what we just did>
+When to emit a marker:
+- WHEN YOU FINISH A COHESIVE SUB-TASK and the user is about to move on
+  (you just delivered the answer / code / fix / explanation that
+  satisfies the current request)
+- BEFORE the user's next message switches topic, if you can predict it
+- AT SESSION END (as a final safeguard)
+
+How to emit a marker — append this single line at the end of the wrapping-
+up assistant response:
+
+    [task-summary]: <action-oriented one-line label>
 
 Rules:
-- Verb + object form (e.g. "排查 Caddy ACME 证书签发失败",
-  "Refactor FastAPI HMAC verification middleware",
-  "上传机械振动作业到 Canvas")
+- Verb + object form: "排查 Caddy ACME 证书签发失败",
+  "Refactor FastAPI HMAC verification", "上传机械振动作业到 Canvas"
 - Maximum 80 characters
 - Match the user's primary language
-- Describe what was actually accomplished — do NOT echo the user's
-  literal first message
-- If the session contained multiple distinct tasks, label the last/main
-  one (the segmenter will split the rest)
-- Skip the marker only if the session was purely a greeting or had no
-  real task
+- Describe what was actually accomplished, NOT the user's literal first
+  message
+- One line, no quotes, no period at the end
+- Skip the marker only if the sub-task was a pure greeting / clarification
+  with no real outcome
 
-The experience-pool uploader (~/.experience-pool/bin/exp) parses this
-line as the experience's `intent` field. Without it, a Python heuristic
-falls back to truncating the user's first message — which produces
-worse search results. Adding this single line at end-of-task keeps the
-pool's titles accurate and costs zero extra tokens (it's part of your
-normal final response).
+Examples in a multi-task session:
+
+    User: 帮我排一下 Caddy 拿不到证书的原因
+    Assistant: <diagnostic steps...>
+    用户的 80 端口被防火墙挡了，开放后 ACME challenge 通过。
+    [task-summary]: 排查并修复 Caddy ACME 80 端口防火墙阻塞
+
+    User: 顺便把 README 翻译成英文
+    Assistant: <translation...>
+    Done — README.md is now translated.
+    [task-summary]: Translate project README from Chinese to English
+
+    User: 谢了
+    Assistant: 不客气！
+
+Each [task-summary] line is parsed by exp_uploader._extract_agent_summary()
+and used as that segment's `intent` field. Without per-task markers,
+earlier segments fall back to a Python heuristic that strips greetings
+from the first user turn — which produces inferior search titles.
+
+This convention costs ZERO extra inference: the marker is part of the
+response you were already going to produce, not a separate call.
 PROMPT

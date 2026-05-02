@@ -1460,15 +1460,24 @@ def _adapter_latest_path_or_id(src: str) -> str:
 # assistant-turn — degenerate spans are dropped.
 # ---------------------------------------------------------------------------
 
+# Agent self-emitted task boundary marker. Matched by both the segmenter
+# (as a hard split signal) and the intent extractor (as the label source).
+_AGENT_SUMMARY_RE = re.compile(
+    r"\[task[-_]summary\]\s*[:：]\s*(.+?)(?:\n|$)",
+    re.IGNORECASE,
+)
+
 _TOPIC_SHIFT_TRIGGERS = (
-    # zh
+    # zh — explicit topic shift markers
     "换个话题", "另一个问题", "另一个事", "另一件事",
     "接下来", "好的接下来", "ok接下来", "现在我",
-    "下一个任务", "下一题", "下一件",
-    "新任务", "另外问个", "另外一个",
+    "下一个任务", "下一题", "下一件", "下一个事",
+    "新任务", "另外问个", "另外一个", "另外帮", "另外想",
+    "顺便", "顺便问", "再问个", "再帮我", "再来一个",
     # en
     "next task", "new task", "different question", "switch topic",
-    "now i need", "moving on", "ok so next",
+    "now i need", "moving on", "ok so next", "another question",
+    "while we're at it", "by the way", "also help me", "one more",
 )
 _MAX_TURNS_PER_SEGMENT = 60
 _DEFAULT_TIME_GAP_MIN = 30
@@ -1504,11 +1513,21 @@ def segment_trajectory(
     max_turns: int = _MAX_TURNS_PER_SEGMENT,
     enable_keyword: bool = True,
 ) -> list[list[Turn]]:
-    """Return a list of segments. Each segment is a slice of `trajectory`."""
+    """Return a list of segments. Each segment is a slice of `trajectory`.
+
+    Split signals (in priority order):
+      1. The PRECEDING assistant turn ended with a `[task-summary]:` marker.
+         This is the agent itself declaring the task is done — it's the
+         strongest possible boundary signal.
+      2. Time gap between adjacent turns ≥ `time_gap_minutes`.
+      3. Topic-shift keyword in the user turn.
+      4. Length cap — segment exceeds `max_turns`.
+    """
     if not trajectory:
         return []
     segments: list[list[Turn]] = [[]]
     last_assistant_ts: _dt.datetime | None = None
+    last_assistant_had_marker = False
     turns_in_current = 0
     has_user_in_current = False
     has_assistant_in_current = False
@@ -1524,15 +1543,24 @@ def segment_trajectory(
         # Decide whether this turn opens a new segment.
         if turn.role == "user" and segments[-1]:
             should_split = False
+            split_reason = ""
+            # Highest-priority signal: the agent itself just labeled
+            # the previous segment as done.
+            if last_assistant_had_marker:
+                should_split = True
+                split_reason = "marker"
             ts = _parse_ts(turn.ts)
-            if last_assistant_ts and ts:
+            if not should_split and last_assistant_ts and ts:
                 gap_min = (ts - last_assistant_ts).total_seconds() / 60.0
                 if gap_min >= time_gap_minutes:
                     should_split = True
+                    split_reason = "time-gap"
             if not should_split and enable_keyword and _is_topic_shift(turn.content):
                 should_split = True
+                split_reason = "keyword"
             if not should_split and turns_in_current >= max_turns:
                 should_split = True
+                split_reason = "length-cap"
             if should_split and has_user_in_current and has_assistant_in_current:
                 _start_new()
         segments[-1].append(turn)
@@ -1544,6 +1572,11 @@ def segment_trajectory(
             ts = _parse_ts(turn.ts)
             if ts:
                 last_assistant_ts = ts
+            # Did this assistant turn end with a [task-summary]: marker?
+            last_assistant_had_marker = bool(_AGENT_SUMMARY_RE.search(turn.content or ""))
+        else:
+            # tool turn — preserve marker state from previous assistant
+            pass
 
     # Drop degenerate segments (need at least one user + one assistant).
     valid: list[list[Turn]] = []
@@ -1603,11 +1636,6 @@ def session_to_segments(session: Session, **kwargs: Any) -> list[Session]:
 #   2. Heuristic: parse the first user turn — strip greetings, extract the
 #      action phrase, truncate.
 # ---------------------------------------------------------------------------
-
-_AGENT_SUMMARY_RE = re.compile(
-    r"\[task[-_]summary\]\s*[:：]\s*(.+?)(?:\n|$)",
-    re.IGNORECASE,
-)
 
 # Throwaway openings (zh + en) we strip from the first user turn.
 _GREETING_PREFIXES = (
