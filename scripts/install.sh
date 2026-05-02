@@ -128,14 +128,30 @@ set -eu
 EOF
 chmod 755 "$HOOK_SCRIPT"
 
+# SessionStart hook script — copy/install the system-context injection that
+# tells the agent to self-label with [task-summary]: at session end.
+SESSION_START_SCRIPT="$BIN_DIR/session_start.sh"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/session_start.sh" ]; then
+    cp "$SCRIPT_DIR/session_start.sh" "$SESSION_START_SCRIPT"
+else
+    # Fetch from gateway if not bundled locally.
+    curl -fsSL --max-time 30 "$BASE/session_start.sh" -o "$SESSION_START_SCRIPT" 2>/dev/null \
+        || cat > "$SESSION_START_SCRIPT" <<'INLINE'
+#!/usr/bin/env bash
+echo "[experience-pool] When you finish a task, append this line to your final response: [task-summary]: <one-line action-oriented label>. The experience-pool uploader uses it as the intent field. Costs zero extra inference."
+INLINE
+fi
+chmod 755 "$SESSION_START_SCRIPT"
+
 # Patch ~/.claude/settings.json (only if Claude Code is detected and not skipped).
 if [ "${EXP_SKIP_HOOK:-0}" != "1" ] && [ -d "$HOME/.claude" ]; then
     SETTINGS="$HOME/.claude/settings.json"
-    note "[4/5] patching Stop hook into $SETTINGS (zero-latency Claude Code upload)"
-    python3 - "$SETTINGS" "$HOOK_SCRIPT" <<'PY'
+    note "[4/5] patching Stop + SessionStart hooks into $SETTINGS"
+    python3 - "$SETTINGS" "$HOOK_SCRIPT" "$SESSION_START_SCRIPT" <<'PY'
 import json, sys, pathlib, os
 settings_path = pathlib.Path(sys.argv[1])
-hook_cmd = sys.argv[2]
+stop_cmd = sys.argv[2]
+start_cmd = sys.argv[3]
 if settings_path.exists():
     try:
         data = json.loads(settings_path.read_text())
@@ -147,17 +163,24 @@ if settings_path.exists():
 else:
     data = {}
 hooks = data.setdefault("hooks", {})
+
+# Stop hook — auto-upload finished session
 stops = hooks.setdefault("Stop", [])
-for entry in stops:
-    if isinstance(entry, dict) and entry.get("command") == hook_cmd:
-        sys.exit(0)
-stops.append({"command": hook_cmd, "description": "experience-pool auto upload"})
+if not any(isinstance(e, dict) and e.get("command") == stop_cmd for e in stops):
+    stops.append({"command": stop_cmd, "description": "experience-pool auto upload"})
+    print(f"[exp] Stop hook installed", file=sys.stderr)
+
+# SessionStart hook — inject [task-summary] convention into agent's context
+starts = hooks.setdefault("SessionStart", [])
+if not any(isinstance(e, dict) and e.get("command") == start_cmd for e in starts):
+    starts.append({"command": start_cmd, "description": "experience-pool task-summary convention"})
+    print(f"[exp] SessionStart hook installed (zero-cost intent labeling)", file=sys.stderr)
+
 settings_path.parent.mkdir(parents=True, exist_ok=True)
 settings_path.write_text(json.dumps(data, indent=2))
-print(f"[exp] Stop hook installed in {settings_path}", file=sys.stderr)
 PY
 else
-    note "[4/5] skipping Claude Code Stop hook (EXP_SKIP_HOOK=1 or ~/.claude not present)"
+    note "[4/5] skipping Claude Code hooks (EXP_SKIP_HOOK=1 or ~/.claude not present)"
 fi
 
 # ---------- 5. universal background daemon (covers all OTHER agents) ----------
