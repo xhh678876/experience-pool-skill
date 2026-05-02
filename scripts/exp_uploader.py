@@ -1330,6 +1330,158 @@ def _adapter_latest_path_or_id(src: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Trajectory segmentation — split a multi-task session into single-task slices.
+#
+# A single live session often contains several distinct tasks ("debug X" then
+# "now write Y" then "translate Z"). Uploading the whole thing as one
+# experience means: query/intent only reflects the first task, embeddings are
+# diluted, and SFT samples mix concerns. Segmentation cuts the trajectory
+# into spans on three signals:
+#
+#   1. Time gap   — adjacent user turn arrives > N minutes after prior
+#                   assistant turn (you walked away → came back fresh)
+#   2. Keyword    — user turn opens with explicit topic-shift markers
+#                   ("换个话题", "next task", "另一个问题", ...)
+#   3. Length cap — any segment > MAX_TURNS forces a soft split at the next
+#                   user-turn boundary (avoids one runaway segment swallowing
+#                   later tasks in pathological sessions)
+#
+# Each segment must contain at least one user-turn AND at least one
+# assistant-turn — degenerate spans are dropped.
+# ---------------------------------------------------------------------------
+
+_TOPIC_SHIFT_TRIGGERS = (
+    # zh
+    "换个话题", "另一个问题", "另一个事", "另一件事",
+    "接下来", "好的接下来", "ok接下来", "现在我",
+    "下一个任务", "下一题", "下一件",
+    "新任务", "另外问个", "另外一个",
+    # en
+    "next task", "new task", "different question", "switch topic",
+    "now i need", "moving on", "ok so next",
+)
+_MAX_TURNS_PER_SEGMENT = 60
+_DEFAULT_TIME_GAP_MIN = 30
+
+
+def _parse_ts(s: str) -> _dt.datetime | None:
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip().rstrip("Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return _dt.datetime.strptime(s.split("+")[0], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_topic_shift(content: str) -> bool:
+    head = (content or "").strip()[:120].lower()
+    if not head:
+        return False
+    for trig in _TOPIC_SHIFT_TRIGGERS:
+        if trig in head or trig.lower() in head:
+            return True
+    return False
+
+
+def segment_trajectory(
+    trajectory: list[Turn],
+    *,
+    time_gap_minutes: int = _DEFAULT_TIME_GAP_MIN,
+    max_turns: int = _MAX_TURNS_PER_SEGMENT,
+    enable_keyword: bool = True,
+) -> list[list[Turn]]:
+    """Return a list of segments. Each segment is a slice of `trajectory`."""
+    if not trajectory:
+        return []
+    segments: list[list[Turn]] = [[]]
+    last_assistant_ts: _dt.datetime | None = None
+    turns_in_current = 0
+    has_user_in_current = False
+    has_assistant_in_current = False
+
+    def _start_new() -> None:
+        nonlocal turns_in_current, has_user_in_current, has_assistant_in_current
+        segments.append([])
+        turns_in_current = 0
+        has_user_in_current = False
+        has_assistant_in_current = False
+
+    for turn in trajectory:
+        # Decide whether this turn opens a new segment.
+        if turn.role == "user" and segments[-1]:
+            should_split = False
+            ts = _parse_ts(turn.ts)
+            if last_assistant_ts and ts:
+                gap_min = (ts - last_assistant_ts).total_seconds() / 60.0
+                if gap_min >= time_gap_minutes:
+                    should_split = True
+            if not should_split and enable_keyword and _is_topic_shift(turn.content):
+                should_split = True
+            if not should_split and turns_in_current >= max_turns:
+                should_split = True
+            if should_split and has_user_in_current and has_assistant_in_current:
+                _start_new()
+        segments[-1].append(turn)
+        turns_in_current += 1
+        if turn.role == "user":
+            has_user_in_current = True
+        elif turn.role == "assistant":
+            has_assistant_in_current = True
+            ts = _parse_ts(turn.ts)
+            if ts:
+                last_assistant_ts = ts
+
+    # Drop degenerate segments (need at least one user + one assistant).
+    valid: list[list[Turn]] = []
+    for seg in segments:
+        roles = {t.role for t in seg}
+        if "user" in roles and "assistant" in roles:
+            valid.append(seg)
+    return valid or [trajectory]  # if filtering nuked everything, return whole
+
+
+def session_to_segments(session: Session, **kwargs: Any) -> list[Session]:
+    """Yield a list of mini-Sessions, one per segment, with proper meta linkage."""
+    segs = segment_trajectory(session.trajectory, **kwargs)
+    if len(segs) <= 1:
+        return [session]
+    out: list[Session] = []
+    base_extra = {k: v for k, v in session.extra.items()
+                  if k != "raw_b64"}  # raw bytes only stay on seg 0
+    for i, seg_turns in enumerate(segs):
+        extra = dict(base_extra)
+        extra["segment"] = {
+            "parent_session_id": session.session_id,
+            "seg_index": i,
+            "total_segments": len(segs),
+            "turn_count": len(seg_turns),
+        }
+        # Only segment 0 carries the (potentially heavy) raw bytes.
+        if i == 0 and "raw_b64" in session.extra:
+            extra["raw_b64"] = session.extra["raw_b64"]
+            extra["raw_size_bytes"] = session.extra.get("raw_size_bytes")
+            extra["raw_sha256"] = session.extra.get("raw_sha256")
+        seg_started = seg_turns[0].ts or session.started_at
+        seg_ended = seg_turns[-1].ts or session.ended_at
+        out.append(Session(
+            agent_type=session.agent_type,
+            session_id=f"{session.session_id}#seg{i}",
+            started_at=seg_started,
+            ended_at=seg_ended,
+            model=session.model,
+            cwd=session.cwd,
+            agent_version=session.agent_version,
+            trajectory=seg_turns,
+            extra=extra,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Lite-card builder (matches cli/src/lite.ts shape).
 # ---------------------------------------------------------------------------
 
@@ -1577,13 +1729,12 @@ def _post_rewards(base: str, cred: dict[str, str], experience_id: str,
           file=sys.stderr)
 
 
-def _push(session: Session, args: argparse.Namespace) -> int:
-    cred = load_credential()
-    if cred is None:
-        raise SystemExit("no credential found. run `exp_uploader register` first.")
+def _push_one(session: Session, args: argparse.Namespace,
+              cred: dict[str, str], parent_eid: str | None = None) -> str | None:
+    """Push a single (already-segmented or whole) session. Returns experience_id."""
     if getattr(args, "full_trace", False):
         src = session.extra.get("source_path") or session.extra.get("db") or ""
-        if src:
+        if src and "raw_b64" not in session.extra:
             _maybe_attach_raw(session, src)
     rewards = _maybe_annotate(session, args)
     if rewards is not None:
@@ -1608,9 +1759,12 @@ def _push(session: Session, args: argparse.Namespace) -> int:
             "cwd": session.cwd,
             "agent_version": session.agent_version,
             "extra": session.extra,
-            "uploader_version": "0.2",
+            "uploader_version": "0.4",
         },
     }
+    if parent_eid:
+        # Server treats this as the segment chain backlink.
+        body["meta"]["parent_experience_ids"] = [parent_eid]
     if body["trajectory"] is None:
         body.pop("trajectory")
     if body["system"] is None:
@@ -1618,22 +1772,51 @@ def _push(session: Session, args: argparse.Namespace) -> int:
     if body["tools"] is None:
         body.pop("tools")
     res = http_request(args.base, "POST", "/v1/lite/push", body, cred=cred)
-    res_min = {
-        "experience_id": res.get("experience_id"),
+    eid = res.get("experience_id")
+    seg_info = session.extra.get("segment", {})
+    out_line = {
+        "session": session.session_id,
+        "agent_type": session.agent_type,
+        "experience_id": eid,
         "review_status": res.get("review_status"),
-        "sanitization_status": res.get("sanitization_status"),
-        "redactions": res.get("redactions"),
     }
-    print(json.dumps({"session": session.session_id, "agent_type": session.agent_type, **res_min},
-                     ensure_ascii=False))
-    # If rewards were just computed, also POST them to /v1/lite/rewards so they
-    # land in turn_rewards (not just in meta.extra). This keeps them
-    # query-able and re-attachable later.
-    if rewards is not None and res.get("experience_id"):
+    if seg_info:
+        out_line["seg"] = f"{seg_info.get('seg_index', 0) + 1}/{seg_info.get('total_segments', 1)}"
+    print(json.dumps(out_line, ensure_ascii=False))
+    if rewards is not None and eid:
         try:
-            _post_rewards(args.base, cred, res["experience_id"], rewards)
+            _post_rewards(args.base, cred, eid, rewards)
         except SystemExit as e:
             print(f"[rewards] post failed: {e}", file=sys.stderr)
+    return eid
+
+
+def _push(session: Session, args: argparse.Namespace) -> int:
+    cred = load_credential()
+    if cred is None:
+        raise SystemExit("no credential found. run `exp_uploader register` first.")
+    # Decide whether to segment. Default: ON; off when --no-segment or
+    # the trajectory is already short enough to be a single task.
+    do_segment = not getattr(args, "no_segment", False)
+    segments: list[Session]
+    if do_segment:
+        segments = session_to_segments(
+            session,
+            time_gap_minutes=getattr(args, "segment_time_gap_min", _DEFAULT_TIME_GAP_MIN),
+            max_turns=getattr(args, "segment_max_turns", _MAX_TURNS_PER_SEGMENT),
+            enable_keyword=not getattr(args, "no_segment_keyword", False),
+        )
+    else:
+        segments = [session]
+    if len(segments) > 1 and getattr(args, "verbose", False):
+        print(f"[segment] split {session.session_id} into {len(segments)} segments",
+              file=sys.stderr)
+    parent_eid: str | None = None
+    for seg in segments:
+        eid = _push_one(seg, args, cred, parent_eid=parent_eid)
+        # Chain: each segment's parent is the previous segment in the same session.
+        if eid:
+            parent_eid = eid
     return 0
 
 
@@ -1807,6 +1990,10 @@ def cmd_daemon_tick(args: argparse.Namespace) -> int:
         no_trace=False,
         full_trace=False,
         annotate=False,
+        no_segment=os.environ.get("EXP_AUTO_SEGMENT", "1").lower() in {"0", "false", "no"},
+        no_segment_keyword=False,
+        segment_time_gap_min=int(os.environ.get("EXP_SEGMENT_TIME_GAP_MIN", "30")),
+        segment_max_turns=int(os.environ.get("EXP_SEGMENT_MAX_TURNS", "60")),
         verbose=args.verbose,
     )
     for src in enabled:
@@ -1983,6 +2170,17 @@ def build_parser() -> argparse.ArgumentParser:
                            help="cap evaluated turns per session (cost control)")
     push_args.add_argument("--annotate-pick", default="even",
                            choices=["first", "even", "important"])
+    push_args.add_argument("--no-segment", action="store_true",
+                           help="upload the whole session as one experience "
+                                "(default is to segment by topic shifts / time gaps)")
+    push_args.add_argument("--no-segment-keyword", action="store_true",
+                           help="disable keyword-based topic-shift detection "
+                                "(time gap + length cap still active)")
+    push_args.add_argument("--segment-time-gap-min", type=int, default=30,
+                           help="minutes of inactivity between turns that triggers a split")
+    push_args.add_argument("--segment-max-turns", type=int, default=60,
+                           help="hard cap: any segment > this many turns force-splits "
+                                "at the next user-turn boundary")
     push_args.add_argument("--verbose", "-v", action="store_true")
 
     sp = sub.add_parser("push", parents=[push_args])
