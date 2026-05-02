@@ -65,21 +65,131 @@ USER_AGENT = "exp_uploader/0.2 (python-stdlib)"
 # ---------------------------------------------------------------------------
 
 _RULES: list[tuple[str, re.Pattern[str], str]] = [
-    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "<SECRET>"),
+    # ----- High-severity: keys / tokens / credentials -----
+    # PEM blocks must run BEFORE other key matchers — they span multiple lines.
+    ("pem_private_key",
+     re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"
+                r"[\s\S]*?"
+                r"-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+     "<PRIVATE_KEY>"),
+    ("ssh_public_key",
+     # ed25519 keys are ~68 chars; rsa keys 200+. Set min to 50 to catch all
+     # real keys but reject random short strings like "ssh-rsa abc".
+     re.compile(r"ssh-(?:rsa|ed25519|dss|ecdsa(?:-[a-z0-9\-]+)?)\s+[A-Za-z0-9+/=]{50,}"),
+     "<SSH_PUBLIC_KEY>"),
+    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"), "<SECRET>"),
     ("openai_key", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9]{20,}\b"), "<SECRET>"),
     ("stripe_secret", re.compile(r"\bsk_live_[0-9a-zA-Z]{16,}\b"), "<SECRET>"),
-    ("github_token", re.compile(r"ghp_[0-9a-zA-Z]{16,}"), "<SECRET>"),
-    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<KEY>"),
-    ("url_credentials", re.compile(r"https?://([^\s/:@]+):([^\s/@]+)@"), "https://<USER>:<PASS>@"),
-    ("email", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<EMAIL>"),
-    ("ipv4", re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b"), "<IP>"),
+    ("stripe_test", re.compile(r"\bsk_test_[0-9a-zA-Z]{16,}\b"), "<SECRET>"),
+    ("github_token", re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[0-9a-zA-Z]{20,}\b"), "<SECRET>"),
+    ("slack_token", re.compile(r"\bxox[abprso]-[0-9A-Za-z\-]{10,}\b"), "<SECRET>"),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<AWS_KEY>"),
+    ("aws_secret_key",
+     re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})[\"']?"),
+     "aws_secret_access_key=<SECRET>"),
+    ("gcp_service_account",
+     re.compile(r"\"private_key\"\s*:\s*\"-----BEGIN[\s\S]+?-----END[^\"]+\""),
+     '"private_key": "<SECRET>"'),
+    ("jwt",
+     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+     "<JWT>"),
+    ("bearer_token",
+     re.compile(r"(?i)(Authorization:\s*Bearer\s+|^Bearer\s+|\bBearer\s+)([A-Za-z0-9._\-]{16,})"),
+     r"\1<TOKEN>"),
+    ("generic_api_key",
+     re.compile(r"(?i)(api[_-]?key|access[_-]?token|secret[_-]?key|"
+                r"password|api_secret|client_secret)\s*[:=]\s*"
+                r"['\"]?([A-Za-z0-9_\-]{12,})['\"]?"),
+     r"\1=<SECRET>"),
+    ("url_credentials",
+     re.compile(r"https?://([^\s/:@]+):([^\s/@]+)@"),
+     "https://<USER>:<PASS>@"),
+
+    # ----- PII: contact + identity -----
+    ("email",
+     re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+     "<EMAIL>"),
+    # Chinese mobile numbers: 11 digits, 1[3-9]xxxxxxxxx
+    ("cn_phone",
+     re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
+     "<PHONE>"),
+    # Generic international phone (e.g. +1 415 555 1212, +44 ...)
+    ("intl_phone",
+     re.compile(r"(?<!\d)\+\d{1,3}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}(?!\d)"),
+     "<PHONE>"),
+    # Chinese national ID: 18 digits, last can be X
+    ("cn_id_card",
+     re.compile(r"(?<!\d)[1-9]\d{5}(?:19|20)\d{2}"
+                r"(?:0[1-9]|1[012])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"),
+     "<CN_ID>"),
+    # Credit card-shaped 13-19 digit run (no Luhn check on client; server does).
+    ("credit_card_shape",
+     re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)"),
+     "<CARD>"),
+    # IP addresses
+    ("ipv4",
+     re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b"),
+     "<IP>"),
+    ("ipv6",
+     # Cover both full 8-group and `::` compressed notation. Anchor on
+     # word/colon boundaries to avoid eating ordinary text.
+     re.compile(
+         r"(?<![A-Za-z0-9:])"
+         r"(?:"
+           r"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"        # full
+           r"|(?:[0-9a-fA-F]{1,4}:){1,7}:"                     # 1::
+           r"|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}"     # 1:2::3
+           r"|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}"
+           r"|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}"
+           r"|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}"
+           r"|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}"
+           r"|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}"
+           r"|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}"     # ::1
+         r")"
+         r"(?![A-Za-z0-9:])"),
+     "<IP>"),
+
+    # ----- Internal identifiers (configurable via env vars) -----
+    # EXP_INTERNAL_HOST_SUFFIXES=corp.example.com,internal.example.com
+    # EXP_EMP_ID_PREFIXES=EMP,STAFF,SJTU
 ]
 
 
+def _build_dynamic_rules() -> list[tuple[str, re.Pattern[str], str]]:
+    """Allow operators to add domain-specific patterns at runtime via env."""
+    extra: list[tuple[str, re.Pattern[str], str]] = []
+    suffixes = [s.strip() for s in os.environ.get("EXP_INTERNAL_HOST_SUFFIXES", "").split(",")
+                if s.strip()]
+    if suffixes:
+        # Build a single regex that matches any internal host suffix.
+        # \b<sub.>?<suffix>\b
+        alt = "|".join(re.escape(s) for s in suffixes)
+        extra.append((
+            "internal_host",
+            re.compile(rf"\b(?:[A-Za-z0-9_\-]+\.)*(?:{alt})\b"),
+            "<INTERNAL_HOST>",
+        ))
+    prefixes = [p.strip() for p in os.environ.get("EXP_EMP_ID_PREFIXES", "").split(",")
+                if p.strip()]
+    if prefixes:
+        alt = "|".join(re.escape(p) for p in prefixes)
+        extra.append((
+            "employee_id",
+            re.compile(rf"(?i)\b(?:{alt})\d{{4,10}}\b"),
+            "<EMP_ID>",
+        ))
+    return extra
+
+
+_DYNAMIC_RULES = _build_dynamic_rules()
+
+
 def sanitize(text: str) -> tuple[str, dict[str, int]]:
+    if not isinstance(text, str) or not text:
+        return text or "", {}
     counts: dict[str, int] = {}
     out = text
-    for name, pat, placeholder in _RULES:
+    for name, pat, placeholder in _RULES + _DYNAMIC_RULES:
         new, n = pat.subn(placeholder, out)
         if n:
             counts[name] = counts.get(name, 0) + n
