@@ -39,29 +39,45 @@ command -v curl >/dev/null 2>&1 || fail "curl not found"
 mkdir -p "$BIN_DIR"
 chmod 700 "$INSTALL_DIR"
 
-# ---------- 1. fetch uploader + annotator ----------
-note "[1/4] downloading exp_uploader.py + exp_annotator.py"
-TMP_UP="$(mktemp)"
-TMP_ANN="$(mktemp)"
-trap 'rm -f "$TMP_UP" "$TMP_ANN"' EXIT
-curl -fsSL --max-time 30 "$BASE/exp_uploader.py" -o "$TMP_UP" \
-    || fail "failed to download $BASE/exp_uploader.py"
-head -1 "$TMP_UP" | grep -q '^#!/usr/bin/env python3' \
-    || fail "downloaded uploader doesn't look right"
-mv "$TMP_UP" "$UPLOADER"
+# ---------- 1. install uploader + annotator ----------
+# If this installer is sitting next to the python files (i.e. you git-cloned
+# the skill repo into ~/.claude/skills/experience-pool/), use those directly.
+# Otherwise download from the gateway.
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P || echo "")"
+ANNOTATOR="$BIN_DIR/exp_annotator.py"
+
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/exp_uploader.py" ]; then
+    note "[1/5] copying local exp_uploader.py from $SCRIPT_DIR"
+    cp "$SCRIPT_DIR/exp_uploader.py" "$UPLOADER"
+else
+    note "[1/5] downloading exp_uploader.py from $BASE"
+    TMP_UP="$(mktemp)"
+    trap 'rm -f "$TMP_UP"' EXIT
+    curl -fsSL --max-time 30 "$BASE/exp_uploader.py" -o "$TMP_UP" \
+        || fail "failed to download $BASE/exp_uploader.py"
+    head -1 "$TMP_UP" | grep -q '^#!/usr/bin/env python3' \
+        || fail "downloaded uploader doesn't look right"
+    mv "$TMP_UP" "$UPLOADER"
+    trap - EXIT
+fi
 chmod 755 "$UPLOADER"
 
-# annotator is optional — if download fails, uploader still works without --annotate
-ANNOTATOR="$BIN_DIR/exp_annotator.py"
-if curl -fsSL --max-time 30 "$BASE/exp_annotator.py" -o "$TMP_ANN" 2>/dev/null \
-   && head -1 "$TMP_ANN" | grep -q '^#!/usr/bin/env python3'; then
-    mv "$TMP_ANN" "$ANNOTATOR"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/exp_annotator.py" ]; then
+    cp "$SCRIPT_DIR/exp_annotator.py" "$ANNOTATOR"
     chmod 755 "$ANNOTATOR"
-    note "      annotator installed (run with: $WRAPPER push --annotate)"
+    note "      annotator installed from local copy"
 else
-    warn "      annotator not available; --annotate flag will be a no-op"
+    TMP_ANN="$(mktemp)"
+    if curl -fsSL --max-time 30 "$BASE/exp_annotator.py" -o "$TMP_ANN" 2>/dev/null \
+       && head -1 "$TMP_ANN" | grep -q '^#!/usr/bin/env python3'; then
+        mv "$TMP_ANN" "$ANNOTATOR"
+        chmod 755 "$ANNOTATOR"
+        note "      annotator installed (use: $WRAPPER push --annotate)"
+    else
+        rm -f "$TMP_ANN"
+        warn "      annotator not available; --annotate flag will be a no-op"
+    fi
 fi
-trap - EXIT
 
 # ---------- 2. shell wrapper ----------
 cat > "$WRAPPER" <<EOF

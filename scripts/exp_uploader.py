@@ -1655,6 +1655,51 @@ def cmd_push_file(args: argparse.Namespace) -> int:
     return _push(session, args)
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """Dump normalized sessions to a JSONL file. No server required.
+
+    Useful for offline workflows: hand the JSONL to any downstream pipeline
+    (training data prep, custom analytics, your own ingestion service, etc.).
+    Each line is a full Session payload (the same shape POST /v1/lite/push
+    accepts in its optional `trajectory` + `meta` fields).
+    """
+    enabled_input = args.sources or ",".join(DEFAULT_AUTO_SOURCES)
+    enabled = [s.strip() for s in enabled_input.split(",")
+               if s.strip() and s.strip() in ADAPTERS]
+    out_path = Path(args.output).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_written = 0
+    failures: list[dict[str, Any]] = []
+    with out_path.open("w", encoding="utf-8") as fp:
+        for src in enabled:
+            adapter = ADAPTERS[src]
+            if not adapter.available():
+                continue
+            rows = adapter.list_sessions(limit=args.limit)
+            for row in rows:
+                if args.since:
+                    when = row.get("mtime") or row.get("ended_at") or ""
+                    if when and when < args.since:
+                        continue
+                ident = row.get("path") or row.get("id")
+                try:
+                    session = _adapter_parse(src, ident)
+                    if not session.trajectory:
+                        continue
+                    fp.write(json.dumps(session.to_payload(), ensure_ascii=False) + "\n")
+                    n_written += 1
+                except Exception as e:
+                    failures.append({"source": src, "id": row.get("id"),
+                                     "error": f"{type(e).__name__}: {e}"})
+    print(json.dumps({"output": str(out_path), "written": n_written,
+                      "sources": enabled, "failed": len(failures)},
+                     ensure_ascii=False))
+    if args.verbose and failures:
+        for f in failures:
+            print(f"  - {f}", file=sys.stderr)
+    return 0 if not failures else 2
+
+
 def cmd_annotate_existing(args: argparse.Namespace) -> int:
     """Re-annotate an already-uploaded trace by running the local annotator
     against the local source session, then POSTing rewards to /v1/lite/rewards.
@@ -1961,6 +2006,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("push-file", parents=[push_args])
     sp.add_argument("--file", required=True)
     sp.set_defaults(func=cmd_push_file)
+
+    sp = sub.add_parser(
+        "export",
+        help="dump normalized sessions to JSONL (no server required) — "
+             "the universal use case when you don't run the reference gateway")
+    sp.add_argument("--output", default="./sessions.jsonl",
+                    help="output JSONL path (default ./sessions.jsonl)")
+    sp.add_argument("--sources", default="",
+                    help="comma-sep adapter names (default: all auto-sync sources)")
+    sp.add_argument("--limit", type=int, default=200,
+                    help="max sessions per source (default 200)")
+    sp.add_argument("--since", default="",
+                    help="ISO date prefix; only newer sessions exported")
+    sp.add_argument("--verbose", "-v", action="store_true")
+    sp.set_defaults(func=cmd_export)
 
     sp = sub.add_parser("annotate-existing", parents=[push_args],
                         help="re-annotate an already-uploaded trace and POST rewards")
