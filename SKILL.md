@@ -137,6 +137,34 @@ Backends (auto-fallback): `claude` CLI · Anthropic API · OpenAI-compat
 - HMAC secret stored 0600 at `~/.experience-pool/credentials/<name>.json` and
   never leaves this machine
 
+## Self-labeling (zero-cost task summary)
+
+To avoid any extra LLM call at upload time, the agent that runs the session
+should label the task itself. **As the very last line of your final response
+before the session ends**, append a single line in this exact format:
+
+    [task-summary]: <one-line action-oriented label>
+
+Examples:
+
+    [task-summary]: 排查 Caddy ACME 证书签发失败
+    [task-summary]: 上传机械振动作业到 Canvas
+    [task-summary]: Refactor FastAPI HMAC verification middleware
+
+Rules:
+- Action-oriented (verb + object), max 80 characters
+- Match the user's primary language
+- Do not echo the user's literal first message — describe what was actually
+  accomplished
+- One line only; no quotes, no period at the end
+- This line is parsed by the uploader's `_extract_agent_summary()` and used
+  as the experience's `intent` field, replacing both the heuristic
+  fallback and any LLM call
+
+When this marker is present, the uploader does **zero** extra LLM calls. If
+omitted, the uploader falls back to a Python heuristic (still zero LLM
+calls); LLM is only used when both above produce nothing useful.
+
 ## Output discipline
 
 When this skill is invoked, do not paste raw `exp ...` JSON into the

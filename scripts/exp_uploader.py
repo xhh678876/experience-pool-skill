@@ -1595,6 +1595,82 @@ def session_to_segments(session: Session, **kwargs: Any) -> list[Session]:
 # Lite-card builder (matches cli/src/lite.ts shape).
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Zero-cost intent extraction — runs BEFORE any LLM call.
+# Two strategies, applied in order:
+#   1. Look for an explicit `[task-summary]: ...` line written by the agent
+#      itself during the session (SKILL.md instructs agents to do this).
+#   2. Heuristic: parse the first user turn — strip greetings, extract the
+#      action phrase, truncate.
+# ---------------------------------------------------------------------------
+
+_AGENT_SUMMARY_RE = re.compile(
+    r"\[task[-_]summary\]\s*[:：]\s*(.+?)(?:\n|$)",
+    re.IGNORECASE,
+)
+
+# Throwaway openings (zh + en) we strip from the first user turn.
+_GREETING_PREFIXES = (
+    "你好", "您好", "hi", "hello", "hey", "嗨",
+    "麻烦", "请", "能否", "可以", "你能", "您能", "可不可以", "能不能",
+    "帮我", "帮个忙", "help me", "could you", "can you", "would you", "please",
+    "我想", "我要", "我需要", "我得", "i want", "i need", "i'd like",
+    "现在", "现在我", "now", "now i",
+)
+
+
+def _extract_agent_summary(trajectory: list[Turn]) -> str | None:
+    """Look for a `[task-summary]: ...` marker the agent emitted itself.
+
+    SKILL.md instructs agents to add this as a final line in their last
+    response. If found, that's the source of truth — zero token cost.
+    """
+    for t in reversed(trajectory):
+        if t.role != "assistant" or not t.content:
+            continue
+        m = _AGENT_SUMMARY_RE.search(t.content)
+        if m:
+            label = m.group(1).strip().strip('"').strip("「」").rstrip(".。 ")
+            if 4 <= len(label) <= 200:
+                return label[:120]
+    return None
+
+
+def _heuristic_summary(turns: list[Turn]) -> str | None:
+    """Pure-Python intent guess from the first user turn. No LLM."""
+    user = next((t for t in turns if t.role == "user" and (t.content or "").strip()), None)
+    if user is None:
+        return None
+    text = user.content.strip().replace("\n", " ")
+    # Strip leading greeting layers, repeatedly.
+    lowered = text.lower()
+    for _ in range(4):
+        stripped = False
+        for prefix in _GREETING_PREFIXES:
+            if lowered.startswith(prefix):
+                text = text[len(prefix):].lstrip(" ,，。.:：!！?？")
+                lowered = text.lower()
+                stripped = True
+                break
+        if not stripped:
+            break
+    # If we stripped to nothing useful, just use the original text.
+    if len(text) < 4:
+        text = user.content.strip().replace("\n", " ")
+    # Take first natural sentence.
+    for sep in ("。", "！", "？", ".", "!", "?", "\n"):
+        idx = text.find(sep)
+        if 0 < idx < 100:
+            text = text[:idx]
+            break
+    text = text.strip().rstrip(".。 ")
+    if not text:
+        return None
+    if len(text) > 80:
+        text = text[:77].rstrip() + "…"
+    return text
+
+
 _INTENT_SYSTEM = """You are a task-labeling tool. You receive a TRANSCRIPT of a past
 conversation between a user and an AI agent, and you output a one-line label
 that names the task the user was working on.
@@ -1716,6 +1792,7 @@ def build_lite_card(
     summarize: bool = False,
     summarizer_backend: str = "auto",
     summarizer_model: str | None = None,
+    summarize_mode: str = "auto",  # auto | heuristic | llm
     verbose: bool = False,
 ) -> dict[str, Any]:
     query = ""
@@ -1741,16 +1818,40 @@ def build_lite_card(
             steps.append(body[:280])
             outcome = body
 
-    # Intent: by default, an LLM-generated task summary; falls back to the
-    # truncated first-user-turn when the summarizer isn't available.
+    # Intent priority (cheapest to most expensive):
+    #   1. agent-emitted [task-summary]: line (0 tokens, found in trajectory)
+    #   2. heuristic from first user turn (0 tokens, pure Python)
+    #   3. LLM call (only when mode=auto AND heuristic is degenerate, OR
+    #      mode=llm explicitly)
+    #   4. literal first-user-turn truncation (fallback)
     summary_intent: str | None = None
     if summarize:
-        summary_intent = summarize_intent(
-            session.trajectory,
-            backend_kind=summarizer_backend,
-            model=summarizer_model,
-            verbose=verbose,
+        summary_intent = _extract_agent_summary(session.trajectory)
+        if summary_intent and verbose:
+            print("[intent] used agent self-emitted [task-summary] marker", file=sys.stderr)
+
+        if summary_intent is None and summarize_mode in ("auto", "heuristic"):
+            summary_intent = _heuristic_summary(session.trajectory)
+            if summary_intent and verbose:
+                print(f"[intent] heuristic → {summary_intent!r}", file=sys.stderr)
+
+        # Only call the LLM when explicitly requested, OR when mode=auto and
+        # heuristic produced nothing useful (rare).
+        should_call_llm = summarize_mode == "llm" or (
+            summarize_mode == "auto" and summary_intent is None
         )
+        if should_call_llm:
+            llm_intent = summarize_intent(
+                session.trajectory,
+                backend_kind=summarizer_backend,
+                model=summarizer_model,
+                verbose=verbose,
+            )
+            if llm_intent:
+                summary_intent = llm_intent
+                if verbose:
+                    print(f"[intent] LLM → {llm_intent!r}", file=sys.stderr)
+
     intent = summary_intent or (query[:120] or "unspecified task").strip()
     return {
         "card": {
@@ -1982,6 +2083,7 @@ def _push_one(session: Session, args: argparse.Namespace,
         acl=args.acl,
         tags=args.tag or [],
         summarize=summarize_flag,
+        summarize_mode=getattr(args, "summarize_mode", "auto"),
         summarizer_backend=getattr(args, "summarizer_backend", "auto"),
         summarizer_model=getattr(args, "summarizer_model", None),
         verbose=getattr(args, "verbose", False),
@@ -2235,6 +2337,10 @@ def cmd_daemon_tick(args: argparse.Namespace) -> int:
         segment_time_gap_min=int(os.environ.get("EXP_SEGMENT_TIME_GAP_MIN", "30")),
         segment_max_turns=int(os.environ.get("EXP_SEGMENT_MAX_TURNS", "60")),
         no_summarize_intent=os.environ.get("EXP_AUTO_SUMMARIZE_INTENT", "1").lower() in {"0", "false", "no"},
+        # Daemon defaults to heuristic-only (zero LLM calls). Set
+        # EXP_SUMMARIZE_MODE=llm to force LLM, or =auto to fall back
+        # to LLM only when the heuristic is degenerate.
+        summarize_mode=os.environ.get("EXP_SUMMARIZE_MODE", "heuristic"),
         summarizer_backend="auto",
         summarizer_model=None,
         verbose=args.verbose,
@@ -2414,12 +2520,19 @@ def build_parser() -> argparse.ArgumentParser:
     push_args.add_argument("--annotate-pick", default="even",
                            choices=["first", "even", "important"])
     push_args.add_argument("--no-summarize-intent", action="store_true",
-                           help="skip LLM-generated task summary; use literal "
-                                "first user turn as intent (fallback behavior)")
+                           help="skip task summary entirely; use literal first "
+                                "user turn (degraded but zero work)")
+    push_args.add_argument("--summarize-mode", default="heuristic",
+                           choices=["auto", "heuristic", "llm"],
+                           help="heuristic (default): zero LLM calls — uses "
+                                "agent's [task-summary] marker if present, "
+                                "else strips greetings from first user turn. "
+                                "auto: heuristic, then LLM only if degenerate. "
+                                "llm: always call LLM (forces extra inference).")
     push_args.add_argument("--summarizer-backend", default="auto",
                            choices=["auto", "claude", "anthropic", "openai"])
     push_args.add_argument("--summarizer-model", default=None,
-                           help="model id for intent summarization (default haiku)")
+                           help="model id for LLM fallback (default haiku)")
     push_args.add_argument("--no-segment", action="store_true",
                            help="upload the whole session as one experience "
                                 "(default is to segment by topic shifts / time gaps)")
