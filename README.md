@@ -3,22 +3,30 @@
 A Claude Code (and friends) **Skill** that auto-uploads every agent session
 to a shared Experience Pool. One-line install, no manual `push` needed.
 
+完整中文说明见 [docs/UPLOAD_LOGIC_AND_MANUAL.md](docs/UPLOAD_LOGIC_AND_MANUAL.md)，覆盖 HMAC 签名、LiteCard 字段、自动上传、批量回填、ACL、检索和常见问题。
+
 ```bash
 curl -sSL https://expool.clawsii.com/install | bash
 ```
 
 ## What this is
 
-A 3-piece system:
+A 5-piece system:
 
 1. **Skill** — `SKILL.md` + helpers; lives at `~/.claude/skills/experience-pool/`
-   so any Claude Code agent on the box knows it can `exp search-lite` /
+   so any Claude Code agent on the box knows it can `exp search` /
    `exp push` / `exp get-rewards`.
 2. **Universal uploader** — `scripts/exp_uploader.py` (stdlib only). Adapters
    for Claude Code, Hermes, agents-chat, Cursor, Aider, Codex, Continue.dev,
    Open Interpreter, plus a robust generic JSON ingester (auto-detects
    OpenAI / Anthropic / LangChain / AutoGen / CrewAI / LangSmith shapes).
-3. **Reward annotator** — `scripts/exp_annotator.py`. Implements Synergy's
+3. **Consent + portal bind** — `scripts/exp_consent.py` and `exp bind` let
+   the intranet portal issue a per-user HMAC credential, then store it locally
+   under `~/.experience-pool/credentials/`.
+4. **Session extractor** — `session-extractor/` bulk-backfills Claude Code /
+   Codex / Hermes / OpenClaw history into the user's private repo without
+   requiring the full CLI to be pre-installed.
+5. **Reward annotator** — `scripts/exp_annotator.py`. Implements Synergy's
    per-turn reward schema (5 dims × `{-1,0,+1}` + confidence + reason),
    slicing `<user>`, `<assistant>`, and the next K turns as delayed feedback
    for the judge. Backends: `claude` CLI · Anthropic API · OpenAI-compat.
@@ -34,7 +42,7 @@ local agent session                     ┌────────────�
    │ ~/.codex/sessions/*                │   every 2 min           │
    │ ...                                │   exp daemon-tick       │
    ▼                                    └────────────┬────────────┘
-adapter normalize → 8-rule client sanitize           │
+adapter normalize → client sanitize                  │
    │                                                 ▼
    └──── HMAC-signed POST /v1/lite/push ─►  expool.clawsii.com
                                                     │
@@ -94,10 +102,28 @@ exp daemon-state                         # see what's been synced
 exp daemon-tick --dry-run -v             # preview next sync
 exp list-sessions --source claude-code   # list local sessions
 exp push-latest --acl team:platform      # one-off
+exp search --q "FastAPI HMAC signature mismatch" --top-k 5
 exp push --session <id> --annotate       # extract + reward + push
 exp get-rewards --experience-id <eid>    # pull stored 5-dim rewards
 exp annotate-existing                    # re-judge with different model
 ```
+
+## Bulk backfill
+
+The portal `/me` page can provide a one-line command with the user's
+agent name and HMAC secret. Use placeholders in docs and scripts; do not
+commit real secrets.
+
+```bash
+curl -fsSL http://10.244.66.195:3080/session-extractor/run.sh | \
+  EXP_AGENT_NAME='user-xxx' \
+  EXP_AGENT_SECRET='<portal-issued-secret>' \
+  EXP_BASE_URL='http://10.244.66.195:3080' \
+  bash
+```
+
+`session-extractor` hardcodes `acl=private` and server-side fingerprinting
+makes repeated runs idempotent.
 
 ## Reward schema (Synergy-compatible)
 
@@ -141,7 +167,11 @@ composite primary key, so multiple judges can co-exist on the same trace.
 SKILL.md                # the Claude Code skill manifest
 scripts/install.sh      # one-shot installer (also served at expool.clawsii.com/install)
 scripts/exp_uploader.py # universal multi-agent uploader (stdlib only)
+scripts/exp_consent.py  # local consent / pending / revoke helpers
 scripts/exp_annotator.py# Synergy-style 5-dim reward annotator
+session-extractor/      # standalone private backfill tool
+agent-contract.md       # behavior contract copied into agent runtime dirs
+docs/UPLOAD_LOGIC_AND_MANUAL.md
 LICENSE                 # MIT
 ```
 

@@ -44,7 +44,9 @@ import hmac
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -61,140 +63,125 @@ USER_AGENT = "exp_uploader/0.2 (python-stdlib)"
 
 
 # ---------------------------------------------------------------------------
-# Sanitizer (client-side, high-confidence rules; server runs full set again).
+# Sanitizer (client-side; server runs the full Layer1+2+3 set again on top).
+#
+# This rule set is intentionally a superset-of-secrets: we lean toward over-
+# masking on the client because the agent host owns the only copy of raw L1.
+# Categories tagged HIGH cause the uploader to emit a warning and (when
+# `--strict-redact` is set) abort upload entirely.
 # ---------------------------------------------------------------------------
 
-_RULES: list[tuple[str, re.Pattern[str], str]] = [
-    # ----- High-severity: keys / tokens / credentials -----
-    # PEM blocks must run BEFORE other key matchers — they span multiple lines.
-    ("pem_private_key",
-     re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"
-                r"[\s\S]*?"
-                r"-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
-     "<PRIVATE_KEY>"),
-    ("ssh_public_key",
-     # ed25519 keys are ~68 chars; rsa keys 200+. Set min to 50 to catch all
-     # real keys but reject random short strings like "ssh-rsa abc".
-     re.compile(r"ssh-(?:rsa|ed25519|dss|ecdsa(?:-[a-z0-9\-]+)?)\s+[A-Za-z0-9+/=]{50,}"),
-     "<SSH_PUBLIC_KEY>"),
-    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"), "<SECRET>"),
-    ("openai_key", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9]{20,}\b"), "<SECRET>"),
-    ("stripe_secret", re.compile(r"\bsk_live_[0-9a-zA-Z]{16,}\b"), "<SECRET>"),
-    ("stripe_test", re.compile(r"\bsk_test_[0-9a-zA-Z]{16,}\b"), "<SECRET>"),
-    ("github_token", re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[0-9a-zA-Z]{20,}\b"), "<SECRET>"),
-    ("slack_token", re.compile(r"\bxox[abprso]-[0-9A-Za-z\-]{10,}\b"), "<SECRET>"),
-    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<AWS_KEY>"),
-    ("aws_secret_key",
-     re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})[\"']?"),
-     "aws_secret_access_key=<SECRET>"),
-    ("gcp_service_account",
-     re.compile(r"\"private_key\"\s*:\s*\"-----BEGIN[\s\S]+?-----END[^\"]+\""),
-     '"private_key": "<SECRET>"'),
-    ("jwt",
-     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
-     "<JWT>"),
-    ("bearer_token",
-     re.compile(r"(?i)(Authorization:\s*Bearer\s+|^Bearer\s+|\bBearer\s+)([A-Za-z0-9._\-]{16,})"),
-     r"\1<TOKEN>"),
-    ("generic_api_key",
-     re.compile(r"(?i)(api[_-]?key|access[_-]?token|secret[_-]?key|"
-                r"password|api_secret|client_secret)\s*[:=]\s*"
-                r"['\"]?([A-Za-z0-9_\-]{12,})['\"]?"),
-     r"\1=<SECRET>"),
-    ("url_credentials",
-     re.compile(r"https?://([^\s/:@]+):([^\s/@]+)@"),
-     "https://<USER>:<PASS>@"),
+_HOME_RE = re.compile(r"/(?:Users|home)/[^/\s'\"]+/")
 
-    # ----- PII: contact + identity -----
-    ("email",
-     re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-     "<EMAIL>"),
-    # Chinese mobile numbers: 11 digits, 1[3-9]xxxxxxxxx
-    ("cn_phone",
-     re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
-     "<PHONE>"),
-    # Generic international phone (e.g. +1 415 555 1212, +44 ...)
-    ("intl_phone",
-     re.compile(r"(?<!\d)\+\d{1,3}[\s\-]?\(?\d{1,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}(?!\d)"),
-     "<PHONE>"),
-    # Chinese national ID: 18 digits, last can be X
-    ("cn_id_card",
-     re.compile(r"(?<!\d)[1-9]\d{5}(?:19|20)\d{2}"
-                r"(?:0[1-9]|1[012])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)"),
-     "<CN_ID>"),
-    # Credit card-shaped 13-19 digit run (no Luhn check on client; server does).
-    ("credit_card_shape",
-     re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)"),
-     "<CARD>"),
-    # IP addresses
-    ("ipv4",
-     re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b"),
-     "<IP>"),
-    ("ipv6",
-     # Cover both full 8-group and `::` compressed notation. Anchor on
-     # word/colon boundaries to avoid eating ordinary text.
-     re.compile(
-         r"(?<![A-Za-z0-9:])"
-         r"(?:"
-           r"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"        # full
-           r"|(?:[0-9a-fA-F]{1,4}:){1,7}:"                     # 1::
-           r"|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}"     # 1:2::3
-           r"|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}"
-           r"|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}"
-           r"|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}"
-           r"|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}"
-           r"|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}"
-           r"|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}"     # ::1
-         r")"
-         r"(?![A-Za-z0-9:])"),
-     "<IP>"),
+_RULES: list[tuple[str, re.Pattern[str], str, str]] = [
+    # --- Vendor secret tokens (HIGH severity) ----------------------------
+    ("anthropic_key",      re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),                      "<SECRET>",        "high"),
+    ("openai_key",         re.compile(r"\bsk-(?!ant-)[A-Za-z0-9]{20,}\b"),                     "<SECRET>",        "high"),
+    ("openai_proj_key",    re.compile(r"\bsk-proj-[A-Za-z0-9_\-]{20,}\b"),                     "<SECRET>",        "high"),
+    ("xai_key",            re.compile(r"\bxai-[A-Za-z0-9]{40,}\b"),                            "<SECRET>",        "high"),
+    ("groq_key",           re.compile(r"\bgsk_[A-Za-z0-9]{40,}\b"),                            "<SECRET>",        "high"),
+    ("google_api_key",     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),                          "<SECRET>",        "high"),
+    ("hf_token",           re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),                             "<SECRET>",        "high"),
+    ("mimo_token",         re.compile(r"\btp-[A-Za-z0-9]{30,}\b"),                             "<SECRET>",        "high"),
+    ("stripe_secret",      re.compile(r"\bsk_(?:live|test)_[0-9a-zA-Z]{16,}\b"),               "<SECRET>",        "high"),
+    ("stripe_publishable", re.compile(r"\bpk_(?:live|test)_[0-9a-zA-Z]{16,}\b"),               "<SECRET>",        "high"),
+    ("github_token",       re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),                      "<SECRET>",        "high"),
+    ("gitlab_token",       re.compile(r"\bglpat-[0-9a-zA-Z_\-]{20,}\b"),                       "<SECRET>",        "high"),
+    ("npm_token",          re.compile(r"\bnpm_[A-Za-z0-9]{30,}\b"),                            "<SECRET>",        "high"),
+    ("vercel_token",       re.compile(r"\b(?:vercel|vc)_[A-Za-z0-9]{20,}\b"),                  "<SECRET>",        "high"),
+    ("supabase_token",     re.compile(r"\bsbp_[A-Za-z0-9]{30,}\b"),                            "<SECRET>",        "high"),
+    ("cloudflare_token",   re.compile(r"\bcfk_[A-Za-z0-9_\-]{30,}\b"),                         "<SECRET>",        "high"),
+    ("sentry_dsn",         re.compile(r"\bsntrys_[A-Za-z0-9_\-]{30,}\b"),                      "<SECRET>",        "high"),
+    ("slack_token",        re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),                   "<SECRET>",        "high"),
+    ("aws_access_key",     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                       "<KEY>",           "high"),
+    ("gcp_sa_key",         re.compile(r"\"private_key\"\s*:\s*\"-----BEGIN[^\"]+\""),          "\"private_key\":\"<PRIVATE_KEY>\"", "high"),
+    ("pem_private_key",    re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+                                                                                                "<PRIVATE_KEY>",   "high"),
+    ("ssh_pubkey_w_email", re.compile(r"ssh-(?:rsa|ed25519|dss)\s+[A-Za-z0-9+/=]{80,}(?:\s+\S+)?"),
+                                                                                                "<SSH_KEY>",       "high"),
+    ("jwt",                re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+                                                                                                "<JWT>",           "high"),
+    ("bearer_authz",       re.compile(r"(?i)Authorization\s*:\s*Bearer\s+[A-Za-z0-9._\-]{16,}"),
+                                                                                                "Authorization: Bearer <TOKEN>", "high"),
+    ("generic_assignment", re.compile(
+        r"(?i)\b(api[_-]?key|access[_-]?token|secret[_-]?key|client[_-]?secret|password|passwd|pwd)\s*[:=]\s*[\"']?([A-Za-z0-9_\-]{16,})[\"']?"),
+                                                                                                r"\1=<SECRET>",    "high"),
+    # url_with_credentials must run BEFORE db_uri so the credentialled form
+    # produces the more readable "<scheme>://<USER>:<PASS>@host" output.
+    ("url_with_credentials", re.compile(r"\b(https?|ftp|ssh|sftp|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://([^\s/:@]+):([^\s/@]+)@"),
+                                                                                                r"\1://<USER>:<PASS>@", "high"),
+    ("db_uri",             re.compile(r"\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|clickhouse)://[^\s\"'<>]+"),
+                                                                                                r"\1://<DB_URI>",  "high"),
 
-    # ----- Internal identifiers (configurable via env vars) -----
-    # EXP_INTERNAL_HOST_SUFFIXES=corp.example.com,internal.example.com
-    # EXP_EMP_ID_PREFIXES=EMP,STAFF,SJTU
+    # --- PII (MEDIUM) -----------------------------------------------------
+    ("email",              re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"), "<EMAIL>",         "medium"),
+    ("phone_intl",         re.compile(r"(?<![\w@])\+\d{1,3}[\s.\-]?\d{2,4}[\s.\-]?\d{3,4}[\s.\-]?\d{3,4}\b"),
+                                                                                                "<PHONE>",         "medium"),
+    ("phone_cn",           re.compile(r"(?<![\w@\d])(?:\+?86[\s\-]?)?1[3-9]\d{9}\b"),           "<PHONE>",         "medium"),
+    ("idcard_cn",          re.compile(r"(?<![\w\d])[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?![\w\d])"),
+                                                                                                "<ID_CARD>",       "high"),
+
+    # --- Network identifiers (LOW) ---------------------------------------
+    ("ipv4",               re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b"),
+                                                                                                "<IP>",            "low"),
+    ("ipv6",               re.compile(r"\b(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}\b"),         "<IP>",            "low"),
+
+    # --- Path → username strip (LOW) -------------------------------------
+    # /Users/xiehaohui/foo  →  /Users/<USER>/foo
+    ("home_path",          _HOME_RE,                                                            "<HOMEDIR>/",      "low"),
 ]
 
-
-def _build_dynamic_rules() -> list[tuple[str, re.Pattern[str], str]]:
-    """Allow operators to add domain-specific patterns at runtime via env."""
-    extra: list[tuple[str, re.Pattern[str], str]] = []
-    suffixes = [s.strip() for s in os.environ.get("EXP_INTERNAL_HOST_SUFFIXES", "").split(",")
-                if s.strip()]
-    if suffixes:
-        # Build a single regex that matches any internal host suffix.
-        # \b<sub.>?<suffix>\b
-        alt = "|".join(re.escape(s) for s in suffixes)
-        extra.append((
-            "internal_host",
-            re.compile(rf"\b(?:[A-Za-z0-9_\-]+\.)*(?:{alt})\b"),
-            "<INTERNAL_HOST>",
-        ))
-    prefixes = [p.strip() for p in os.environ.get("EXP_EMP_ID_PREFIXES", "").split(",")
-                if p.strip()]
-    if prefixes:
-        alt = "|".join(re.escape(p) for p in prefixes)
-        extra.append((
-            "employee_id",
-            re.compile(rf"(?i)\b(?:{alt})\d{{4,10}}\b"),
-            "<EMP_ID>",
-        ))
-    return extra
-
-
-_DYNAMIC_RULES = _build_dynamic_rules()
+# Categories whose hits should bump the upload to high severity.
+_HIGH_CATEGORIES = {name for (name, _p, _r, sev) in _RULES if sev == "high"}
 
 
 def sanitize(text: str) -> tuple[str, dict[str, int]]:
-    if not isinstance(text, str) or not text:
-        return text or "", {}
+    """Apply every rule in order. Returns (clean, hits_by_category)."""
     counts: dict[str, int] = {}
     out = text
-    for name, pat, placeholder in _RULES + _DYNAMIC_RULES:
+    for name, pat, placeholder, _sev in _RULES:
         new, n = pat.subn(placeholder, out)
         if n:
             counts[name] = counts.get(name, 0) + n
             out = new
     return out, counts
+
+
+# Keys that are pure identifiers / structure — sanitizing them would corrupt
+# routing on the server side (tool_use_id, role, etc.). Skip from recursion.
+_SKIP_KEYS = frozenset({
+    "id", "type", "role", "tool_use_id", "tool_call_id",
+    "name", "subtype", "model", "stop_reason", "stop_sequence",
+    "usage", "index", "ts", "tool_result_for",
+})
+
+
+def sanitize_node(node: Any, counts: dict[str, int]) -> Any:
+    """Recursively sanitize every string in a dict/list/scalar tree.
+
+    Mutates the `counts` dict in place. Pure structural keys are skipped so
+    routing identifiers stay intact."""
+    if isinstance(node, str):
+        cleaned, c = sanitize(node)
+        for k, v in c.items():
+            counts[k] = counts.get(k, 0) + v
+        return cleaned
+    if isinstance(node, list):
+        return [sanitize_node(item, counts) for item in node]
+    if isinstance(node, dict):
+        out: dict[str, Any] = {}
+        for k, v in node.items():
+            if k in _SKIP_KEYS or not isinstance(v, (str, list, dict)):
+                out[k] = v
+            else:
+                out[k] = sanitize_node(v, counts)
+        return out
+    return node
+
+
+def has_high_severity(counts: dict[str, int]) -> bool:
+    """True iff any high-severity rule fired."""
+    return any(name in _HIGH_CATEGORIES and n > 0 for name, n in counts.items())
 
 
 # ---------------------------------------------------------------------------
@@ -373,18 +360,33 @@ class ClaudeCodeAdapter:
                 content = msg.get("content", [])
                 if isinstance(content, list):
                     text_parts: list[str] = []
+                    thinking_parts: list[str] = []
                     tool_calls: list[dict[str, Any]] = []
                     for block in content:
                         if not isinstance(block, dict):
                             continue
-                        if block.get("type") == "text":
+                        bt = block.get("type")
+                        if bt == "text":
                             text_parts.append(block.get("text", ""))
-                        elif block.get("type") == "tool_use":
+                        elif bt == "thinking":
+                            # keep the readable text, drop opaque base64 signature
+                            tk = block.get("thinking") or ""
+                            if tk:
+                                thinking_parts.append(tk)
+                        elif bt == "tool_use":
                             tool_calls.append({
                                 "id": block.get("id", ""),
                                 "name": block.get("name", ""),
                                 "input": block.get("input", {}),
                             })
+                    # Emit thinking blocks as their own assistant turns so the
+                    # UI renders them in dedicated thinking-styled bubbles.
+                    for tk in thinking_parts:
+                        turns.append(Turn(
+                            role="assistant",
+                            content="💭 思考\n\n" + tk,
+                            ts=ts,
+                        ))
                     text = "\n".join(p for p in text_parts if p.strip())
                     if text or tool_calls:
                         turns.append(Turn(
@@ -1109,55 +1111,157 @@ class CodexAdapter:
     def parse(cls, ident: str) -> Session:
         p = Path(ident).expanduser()
         if not p.is_file():
-            for f in cls.root().rglob(f"{ident}*"):
+            # rglob can't handle absolute paths — strip to basename for lookup
+            stem = Path(ident).name
+            for f in cls.root().rglob(f"{stem}*"):
                 p = f
                 break
         if not p.is_file():
             raise FileNotFoundError(f"codex session not found: {ident}")
         turns: list[Turn] = []
         text = p.read_text(encoding="utf-8")
-        # Try JSONL first, fall back to single JSON object.
-        records: list[dict[str, Any]] = []
+        # Codex rollouts are JSONL — each line is `{type, payload}`. We use
+        # `response_item` records as the source of truth (event_msg lines
+        # duplicate the same content) and emit one turn per logical block:
+        # message text, reasoning (thinking), function_call (tool_use),
+        # function_call_output (tool_result).
+        role_norm = {"developer": "system", "tool": "tool"}
+        model = ""
+        started_at = ""
+        ended_at = ""
+        cwd = ""
+
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    records.append(obj)
+                d = json.loads(line)
             except json.JSONDecodeError:
-                records = []
-                break
-        if not records:
-            try:
-                obj = json.loads(text)
-                if isinstance(obj, dict):
-                    records = obj.get("messages") or obj.get("turns") or [obj]
-            except json.JSONDecodeError:
-                pass
-        model = ""
-        for rec in records:
-            role = rec.get("role") or rec.get("type") or ""
-            content = rec.get("content") or rec.get("text") or rec.get("message", "")
-            if isinstance(content, list):
-                content = "\n".join(
-                    str(b.get("text", "")) for b in content
-                    if isinstance(b, dict) and b.get("type") == "text"
-                )
-            if not isinstance(content, str):
-                content = json.dumps(content, ensure_ascii=False)
-            if role and content.strip():
-                turns.append(Turn(role=role, content=content))
-            if not model and rec.get("model"):
-                model = rec["model"]
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = d.get("timestamp", "") or d.get("ended_at", "")
+            if ts:
+                if not started_at:
+                    started_at = ts
+                ended_at = ts
+            if d.get("type") == "session_meta":
+                meta_payload = d.get("payload") or {}
+                if isinstance(meta_payload, dict):
+                    model = model or meta_payload.get("model", "")
+                    cwd = cwd or meta_payload.get("cwd", "")
+
+            # legacy direct {role, content} fallback
+            if "role" in d and "content" in d:
+                role = role_norm.get(d.get("role"), d.get("role"))
+                content = d.get("content")
+                if isinstance(content, list):
+                    parts = [
+                        str(b.get("text", ""))
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") in ("text", "input_text", "output_text")
+                    ]
+                    content = "\n".join(parts)
+                if role in ("user", "assistant", "system", "tool") and isinstance(content, str) and content.strip():
+                    turns.append(Turn(role=role, content=content, ts=ts))
+                continue
+
+            if d.get("type") != "response_item":
+                continue
+            payload = d.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            ptype = payload.get("type")
+
+            if ptype == "message":
+                role = role_norm.get(payload.get("role"), payload.get("role"))
+                if role not in ("user", "assistant", "system", "tool"):
+                    continue
+                content = payload.get("content", "")
+                text_parts: list[str] = []
+                if isinstance(content, str):
+                    text_parts.append(content)
+                elif isinstance(content, list):
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") in ("input_text", "output_text", "text"):
+                            text_parts.append(c.get("text", "") or "")
+                merged = "\n".join(p for p in text_parts if p.strip())
+                if merged.strip():
+                    turns.append(Turn(role=role, content=merged, ts=ts))
+
+            elif ptype == "reasoning":
+                # `summary` is human-readable thinking text; `encrypted_content`
+                # is opaque base64 — drop it.
+                summ = payload.get("summary") or []
+                parts = []
+                if isinstance(summ, list):
+                    for s in summ:
+                        if isinstance(s, dict):
+                            t_ = s.get("text") or ""
+                            if t_.strip():
+                                parts.append(t_)
+                        elif isinstance(s, str) and s.strip():
+                            parts.append(s)
+                inline = payload.get("content")
+                if isinstance(inline, str) and inline.strip():
+                    parts.append(inline)
+                if parts:
+                    turns.append(Turn(
+                        role="assistant",
+                        content="💭 思考\n\n" + "\n\n".join(parts),
+                        ts=ts,
+                    ))
+
+            elif ptype == "function_call":
+                name = payload.get("name", "tool")
+                args_raw = payload.get("arguments", "")
+                try:
+                    args_obj = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    args_obj = args_raw
+                turns.append(Turn(
+                    role="assistant",
+                    content="",
+                    ts=ts,
+                    tool_calls=[{
+                        "id": payload.get("call_id", ""),
+                        "name": name,
+                        "input": args_obj,
+                    }],
+                ))
+
+            elif ptype == "function_call_output":
+                output = payload.get("output", "")
+                disp = output
+                if isinstance(output, str):
+                    try:
+                        parsed = json.loads(output)
+                        if isinstance(parsed, dict):
+                            if "output" in parsed:
+                                disp = parsed["output"]
+                            elif "content" in parsed:
+                                disp = parsed["content"]
+                    except Exception:
+                        pass
+                if not isinstance(disp, str):
+                    disp = json.dumps(disp, ensure_ascii=False)
+                turns.append(Turn(
+                    role="tool",
+                    content=disp,
+                    ts=ts,
+                    tool_result_for=payload.get("call_id", ""),
+                ))
+
         return Session(
             agent_type=cls.name,
             session_id=p.stem,
-            started_at="",
-            ended_at=_dt.datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds"),
+            started_at=started_at,
+            ended_at=ended_at or _dt.datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds"),
             model=model or "codex-unknown",
-            cwd=str(p.parent),
+            cwd=cwd or str(p.parent),
             agent_version="",
             trajectory=turns,
             extra={"source_path": str(p)},
@@ -1440,374 +1544,236 @@ def _adapter_latest_path_or_id(src: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Trajectory segmentation — split a multi-task session into single-task slices.
-#
-# A single live session often contains several distinct tasks ("debug X" then
-# "now write Y" then "translate Z"). Uploading the whole thing as one
-# experience means: query/intent only reflects the first task, embeddings are
-# diluted, and SFT samples mix concerns. Segmentation cuts the trajectory
-# into spans on three signals:
-#
-#   1. Time gap   — adjacent user turn arrives > N minutes after prior
-#                   assistant turn (you walked away → came back fresh)
-#   2. Keyword    — user turn opens with explicit topic-shift markers
-#                   ("换个话题", "next task", "另一个问题", ...)
-#   3. Length cap — any segment > MAX_TURNS forces a soft split at the next
-#                   user-turn boundary (avoids one runaway segment swallowing
-#                   later tasks in pathological sessions)
-#
-# Each segment must contain at least one user-turn AND at least one
-# assistant-turn — degenerate spans are dropped.
-# ---------------------------------------------------------------------------
-
-# Agent self-emitted task boundary marker. Matched by both the segmenter
-# (as a hard split signal) and the intent extractor (as the label source).
-_AGENT_SUMMARY_RE = re.compile(
-    r"\[task[-_]summary\]\s*[:：]\s*(.+?)(?:\n|$)",
-    re.IGNORECASE,
-)
-
-_TOPIC_SHIFT_TRIGGERS = (
-    # zh — explicit topic shift markers
-    "换个话题", "另一个问题", "另一个事", "另一件事",
-    "接下来", "好的接下来", "ok接下来", "现在我",
-    "下一个任务", "下一题", "下一件", "下一个事",
-    "新任务", "另外问个", "另外一个", "另外帮", "另外想",
-    "顺便", "顺便问", "再问个", "再帮我", "再来一个",
-    # en
-    "next task", "new task", "different question", "switch topic",
-    "now i need", "moving on", "ok so next", "another question",
-    "while we're at it", "by the way", "also help me", "one more",
-)
-_MAX_TURNS_PER_SEGMENT = 60
-_DEFAULT_TIME_GAP_MIN = 30
-
-
-def _parse_ts(s: str) -> _dt.datetime | None:
-    if not s or not isinstance(s, str):
-        return None
-    s = s.strip().rstrip("Z")
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return _dt.datetime.strptime(s.split("+")[0], fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def _is_topic_shift(content: str) -> bool:
-    head = (content or "").strip()[:120].lower()
-    if not head:
-        return False
-    for trig in _TOPIC_SHIFT_TRIGGERS:
-        if trig in head or trig.lower() in head:
-            return True
-    return False
-
-
-def segment_trajectory(
-    trajectory: list[Turn],
-    *,
-    time_gap_minutes: int = _DEFAULT_TIME_GAP_MIN,
-    max_turns: int = _MAX_TURNS_PER_SEGMENT,
-    enable_keyword: bool = True,
-) -> list[list[Turn]]:
-    """Return a list of segments. Each segment is a slice of `trajectory`.
-
-    Split signals (in priority order):
-      1. The PRECEDING assistant turn ended with a `[task-summary]:` marker.
-         This is the agent itself declaring the task is done — it's the
-         strongest possible boundary signal.
-      2. Time gap between adjacent turns ≥ `time_gap_minutes`.
-      3. Topic-shift keyword in the user turn.
-      4. Length cap — segment exceeds `max_turns`.
-    """
-    if not trajectory:
-        return []
-    segments: list[list[Turn]] = [[]]
-    last_assistant_ts: _dt.datetime | None = None
-    last_assistant_had_marker = False
-    turns_in_current = 0
-    has_user_in_current = False
-    has_assistant_in_current = False
-
-    def _start_new() -> None:
-        nonlocal turns_in_current, has_user_in_current, has_assistant_in_current
-        segments.append([])
-        turns_in_current = 0
-        has_user_in_current = False
-        has_assistant_in_current = False
-
-    for turn in trajectory:
-        # Decide whether this turn opens a new segment.
-        if turn.role == "user" and segments[-1]:
-            should_split = False
-            split_reason = ""
-            # Highest-priority signal: the agent itself just labeled
-            # the previous segment as done.
-            if last_assistant_had_marker:
-                should_split = True
-                split_reason = "marker"
-            ts = _parse_ts(turn.ts)
-            if not should_split and last_assistant_ts and ts:
-                gap_min = (ts - last_assistant_ts).total_seconds() / 60.0
-                if gap_min >= time_gap_minutes:
-                    should_split = True
-                    split_reason = "time-gap"
-            if not should_split and enable_keyword and _is_topic_shift(turn.content):
-                should_split = True
-                split_reason = "keyword"
-            if not should_split and turns_in_current >= max_turns:
-                should_split = True
-                split_reason = "length-cap"
-            if should_split and has_user_in_current and has_assistant_in_current:
-                _start_new()
-        segments[-1].append(turn)
-        turns_in_current += 1
-        if turn.role == "user":
-            has_user_in_current = True
-        elif turn.role == "assistant":
-            has_assistant_in_current = True
-            ts = _parse_ts(turn.ts)
-            if ts:
-                last_assistant_ts = ts
-            # Did this assistant turn end with a [task-summary]: marker?
-            last_assistant_had_marker = bool(_AGENT_SUMMARY_RE.search(turn.content or ""))
-        else:
-            # tool turn — preserve marker state from previous assistant
-            pass
-
-    # Drop degenerate segments (need at least one user + one assistant).
-    valid: list[list[Turn]] = []
-    for seg in segments:
-        roles = {t.role for t in seg}
-        if "user" in roles and "assistant" in roles:
-            valid.append(seg)
-    return valid or [trajectory]  # if filtering nuked everything, return whole
-
-
-def session_to_segments(session: Session, **kwargs: Any) -> list[Session]:
-    """Yield a list of mini-Sessions, one per segment, with proper meta linkage."""
-    segs = segment_trajectory(session.trajectory, **kwargs)
-    if len(segs) <= 1:
-        return [session]
-    out: list[Session] = []
-    base_extra = {k: v for k, v in session.extra.items()
-                  if k != "raw_b64"}  # raw bytes only stay on seg 0
-    for i, seg_turns in enumerate(segs):
-        extra = dict(base_extra)
-        extra["segment"] = {
-            "parent_session_id": session.session_id,
-            "seg_index": i,
-            "total_segments": len(segs),
-            "turn_count": len(seg_turns),
-        }
-        # Only segment 0 carries the (potentially heavy) raw bytes.
-        if i == 0 and "raw_b64" in session.extra:
-            extra["raw_b64"] = session.extra["raw_b64"]
-            extra["raw_size_bytes"] = session.extra.get("raw_size_bytes")
-            extra["raw_sha256"] = session.extra.get("raw_sha256")
-        seg_started = seg_turns[0].ts or session.started_at
-        seg_ended = seg_turns[-1].ts or session.ended_at
-        out.append(Session(
-            agent_type=session.agent_type,
-            session_id=f"{session.session_id}#seg{i}",
-            started_at=seg_started,
-            ended_at=seg_ended,
-            model=session.model,
-            cwd=session.cwd,
-            agent_version=session.agent_version,
-            trajectory=seg_turns,
-            extra=extra,
-        ))
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Lite-card builder (matches cli/src/lite.ts shape).
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Zero-cost intent extraction — runs BEFORE any LLM call.
-# Two strategies, applied in order:
-#   1. Look for an explicit `[task-summary]: ...` line written by the agent
-#      itself during the session (SKILL.md instructs agents to do this).
-#   2. Heuristic: parse the first user turn — strip greetings, extract the
-#      action phrase, truncate.
-# ---------------------------------------------------------------------------
+def _derive_title_heuristic(query: str) -> str:
+    """Fallback title from first user message — used if LLM refine is off
+    or fails. Kept as a separate function so the LLM path can wrap it."""
+    text = (query or "").strip()
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if not line:
+        return "unspecified task"
+    head = line[:120]
+    cut_at = -1
+    for sep in ("。", "！", "？", ". ", "! ", "? ", "\n"):
+        idx = head.find(sep)
+        if idx > 0 and (cut_at < 0 or idx < cut_at):
+            cut_at = idx + len(sep)
+    title = head[:cut_at].strip() if cut_at > 0 else head.strip()
+    title = " ".join(title.split())
+    if len(title) > 70:
+        title = title[:69].rstrip() + "…"
+    return title or "unspecified task"
 
-# Throwaway openings (zh + en) we strip from the first user turn.
-_GREETING_PREFIXES = (
-    "你好", "您好", "hi", "hello", "hey", "嗨",
-    "麻烦", "请", "能否", "可以", "你能", "您能", "可不可以", "能不能",
-    "帮我", "帮个忙", "help me", "could you", "can you", "would you", "please",
-    "我想", "我要", "我需要", "我得", "i want", "i need", "i'd like",
-    "现在", "现在我", "now", "now i",
+
+_TITLE_SYSTEM = (
+    "你是「会话标题」生成器。给定一段 agent 对话 transcript,输出一行简短标题。\n"
+    "\n"
+    "格式硬要求(违反就算失败):\n"
+    "1. 只输出一行,绝不换行,不分段\n"
+    "2. 中文 ≤25 字,英文 ≤8 词\n"
+    "3. 用「动词 + 对象」结构(如 `部署 OPF 服务`、`Refactor login flow`)\n"
+    "4. 标题语言匹配用户语言\n"
+    "5. 不要任何 markdown/引号/句末标点/emoji\n"
+    "6. 不要任何对话性、解释性、第一人称、提问语句\n"
+    "7. 全是闲聊就输出:(闲聊)\n"
+    "\n"
+    "✅ 正确示范:\n"
+    "  部署 OPF 服务到独立 GPU 机器\n"
+    "  修复 push 慢的瓶颈\n"
+    "  配置 Claude Code 状态栏\n"
+    "  Refactor login flow\n"
+    "  Diagnose proxy connectivity issue\n"
+    "\n"
+    "❌ 错误示范(绝对不允许):\n"
+    "  Waiting for your approval to write…\n"
+    "  我需要澄清一下\n"
+    "  I'll extract this trajectory\n"
+    "  The transcript is truncated\n"
+    "  <transcript>\n"
+    "  Looking at this conversation\n"
+    "  📥 connected to experience pool\n"
+    "\n"
+    "**只输出标题那一行,前后无任何额外文字。**"
 )
 
 
-def _extract_agent_summary(trajectory: list[Turn]) -> str | None:
-    """Look for a `[task-summary]: ...` marker the agent emitted itself.
+# Post-LLM filter: reject the response and fall back to heuristic if the
+# label looks like model rambling (conversational opener, English filler,
+# echoed input markers, etc).
+_BAD_TITLE_PREFIXES = (
+    "<", "[", "(", "the ", "i ", "i'", "it ", "it'", "let ", "let's", "we ", "we'",
+    "looking", "let me", "sure", "okay", "ok,", "hi,", "hi!", "hello",
+    "yes,", "no,", "sorry", "waiting", "based on", "from the",
+    "我需要", "我看到", "我注意", "我会", "这段", "这个", "这是", "这条",
+    "看起来", "根据", "请告诉", "请提供", "你好",
+)
+_BAD_TITLE_SUBSTRINGS = (
+    "approval", "permission", "transcript", "got cut off", "truncated",
+    "incomplete", "could you clarify", "what would you", "what can i",
+    "请确认", "需要确认", "需要权限", "请提供更多",
+)
 
-    SKILL.md instructs agents to add this as a final line in their last
-    response. If found, that's the source of truth — zero token cost.
+
+def _looks_bad_title(label: str) -> bool:
+    if not label:
+        return True
+    if label == "(闲聊)":
+        return False
+    low = label.lower().strip()
+    if low.startswith(_BAD_TITLE_PREFIXES):
+        return True
+    if any(s in low for s in _BAD_TITLE_SUBSTRINGS):
+        return True
+    # Ends with ellipsis → was a wrapped sentence, not a title
+    if label.endswith(("…", "...")):
+        return True
+    return False
+
+
+def _pack_transcript(trajectory: list[Any], max_chars: int = 6000) -> str:
+    out: list[str] = []
+    used = 0
+    for t in trajectory:
+        role = getattr(t, "role", None) or t.get("role", "")
+        content = (getattr(t, "content", None) or t.get("content", "") or "").strip()
+        tcs = getattr(t, "tool_calls", None) or t.get("tool_calls") or []
+        if not content and not tcs:
+            continue
+        if role == "user":
+            line = f"[用户] {content[:600]}"
+        elif role == "assistant":
+            if tcs:
+                names = ", ".join(str(tc.get("name", "?")) for tc in tcs)
+                line = f"[助手→工具] {names}"
+            else:
+                line = f"[助手] {content[:600]}"
+        elif role == "tool":
+            preview = content[:120].replace("\n", " ")
+            line = f"[工具结果] {preview}{'…' if len(content) > 120 else ''}"
+        else:
+            continue
+        if used + len(line) > max_chars:
+            out.append("...(truncated)")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)
+
+
+def _llm_summarize_title(trajectory: list[Any], timeout: int = 45) -> str | None:
+    """Shell out to local `claude -p` to get a one-line title that
+    summarises the WHOLE conversation. Returns None on any failure so the
+    caller falls back to the heuristic.
+
+    Disabled when EXP_REFINE_TITLES != "1" or claude CLI unavailable.
+    """
+    if os.environ.get("EXP_REFINE_TITLES", "1") != "1":
+        return None
+    if os.environ.get("EXP_TITLE_DISABLE", "0") == "1":
+        return None
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        return None
+    try:
+        transcript = _pack_transcript(trajectory)
+        if not transcript.strip():
+            return None
+        model = os.environ.get("EXP_TITLE_MODEL", "claude-haiku-4-5-20251001")
+        # Critical: disable auto-upload + skip session-start in the spawned
+        # claude subprocess. Otherwise its SessionEnd hook fires and calls
+        # `exp push-latest` again → infinite recursion (push spawns title,
+        # title spawns claude, claude spawns push, …).
+        env = dict(os.environ)
+        env["EXP_AUTO_UPLOAD"] = "0"
+        env["EXP_REFINE_TITLES"] = "0"
+        env["EXP_TITLE_DISABLE"] = "1"
+        proc = subprocess.run(
+            [
+                claude_bin, "-p", "--output-format", "json",
+                "--model", model,
+                "--append-system-prompt", _TITLE_SYSTEM,
+                # don't write a session file to ~/.claude/projects/ —
+                # otherwise daemon-tick picks it up as a new "session"
+                # and uploads it (with title `<transcript>` etc.)
+                "--no-session-persistence",
+                "--disable-slash-commands",
+            ],
+            input=f"<transcript>\n{transcript}\n</transcript>",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+            cwd="/tmp",
+        )
+        if proc.returncode != 0:
+            return None
+        env = json.loads(proc.stdout)
+        if env.get("is_error"):
+            return None
+        raw = (env.get("result") or "").strip()
+        # Strip leading hook-injected "📥 connected to experience pool …"
+        # lines and other auto-prepended notices.
+        lines = [ln.strip() for ln in raw.splitlines()]
+        while lines and (
+            not lines[0]
+            or lines[0].startswith("📥")
+            or "connected to experience pool" in lines[0].lower()
+            or lines[0].startswith("[task-summary]")
+            or lines[0].startswith("📤 uploaded")
+        ):
+            lines.pop(0)
+        label = lines[0] if lines else ""
+        label = label.lstrip("-•*0123456789. ").strip()
+        label = label.strip('"\'`「」『』').strip()
+        if label.endswith(("。", ".", "!", "?", "！", "？", ":", "：")):
+            label = label[:-1]
+        label = " ".join(label.split())
+        if not label or label.lower() in ("(no task)", "(none)"):
+            return None
+        if _looks_bad_title(label):
+            return None
+        if len(label) > 60:
+            label = label[:59] + "…"
+        return label
+    except Exception:
+        return None
+
+
+def _derive_title(query: str, trajectory: list[Any] | None = None) -> str:
+    """Return an LLM-summarised title when possible, else the heuristic."""
+    fallback = _derive_title_heuristic(query)
+    if not trajectory:
+        return fallback
+    llm = _llm_summarize_title(trajectory)
+    return llm or fallback
+
+
+_TASK_SUMMARY_RE = re.compile(r"(?im)^\s*\[task-summary\]\s*[:：]\s*(.+?)\s*$")
+
+
+def _extract_task_summary_title(trajectory: list[Any]) -> str:
+    """Prefer the explicit task-summary marker when the agent emitted one.
+
+    This keeps titles useful even when the LLM title pass is disabled, rate
+    limited, or unavailable.
     """
     for t in reversed(trajectory):
-        if t.role != "assistant" or not t.content:
+        content = getattr(t, "content", None) or t.get("content", "") or ""
+        if not content:
             continue
-        m = _AGENT_SUMMARY_RE.search(t.content)
-        if m:
-            label = m.group(1).strip().strip('"').strip("「」").rstrip(".。 ")
-            if 4 <= len(label) <= 200:
-                return label[:120]
-    return None
-
-
-def _heuristic_summary(turns: list[Turn]) -> str | None:
-    """Pure-Python intent guess from the first user turn. No LLM."""
-    user = next((t for t in turns if t.role == "user" and (t.content or "").strip()), None)
-    if user is None:
-        return None
-    text = user.content.strip().replace("\n", " ")
-    # Strip leading greeting layers, repeatedly.
-    lowered = text.lower()
-    for _ in range(4):
-        stripped = False
-        for prefix in _GREETING_PREFIXES:
-            if lowered.startswith(prefix):
-                text = text[len(prefix):].lstrip(" ,，。.:：!！?？")
-                lowered = text.lower()
-                stripped = True
-                break
-        if not stripped:
-            break
-    # If we stripped to nothing useful, just use the original text.
-    if len(text) < 4:
-        text = user.content.strip().replace("\n", " ")
-    # Take first natural sentence.
-    for sep in ("。", "！", "？", ".", "!", "?", "\n"):
-        idx = text.find(sep)
-        if 0 < idx < 100:
-            text = text[:idx]
-            break
-    text = text.strip().rstrip(".。 ")
-    if not text:
-        return None
-    if len(text) > 80:
-        text = text[:77].rstrip() + "…"
-    return text
-
-
-_INTENT_SYSTEM = """You are a task-labeling tool. You receive a TRANSCRIPT of a past
-conversation between a user and an AI agent, and you output a one-line label
-that names the task the user was working on.
-
-CRITICAL — you are NOT continuing the conversation. You are NOT a participant.
-You are a labeler. You read the transcript from the outside.
-
-Output rules (strict):
-- Exactly ONE line, no preamble, no quotes, no trailing punctuation
-- Maximum 80 characters
-- Action-oriented: a verb phrase or noun-of-action (e.g. "Debug FastAPI HMAC
-  signature mismatch", "上传 PDF 作业并生成解题大纲", "Plan Lobster Square
-  building takeover")
-- Match the language the user predominantly used in the transcript
-- Do NOT echo the user's literal first message
-- Do NOT include role labels, emojis, "the user wants to", "task:", etc.
-- If the transcript is purely a greeting / acknowledgment / has no real task,
-  output exactly: (no task)
-
-Examples:
-
-TRANSCRIPT:
-[user] csv revenue 按区域汇总然后按 quarter 排序
-[assistant] 我用 pandas...
-LABEL: 按区域汇总 CSV 营收并按季度排序
-
-TRANSCRIPT:
-[user] hi there
-[assistant] hello! how can i help?
-LABEL: (no task)
-
-TRANSCRIPT:
-[user] 我的 Caddy 拿不到 cert，报 acme challenge 失败
-[assistant] 检查 80 端口是否开放...
-LABEL: 排查 Caddy Let's Encrypt ACME 证书签发失败
-
-Now do the same for the transcript that follows."""
-
-
-def _format_for_intent(turns: list[Turn], max_chars: int = 4000) -> str:
-    """Compact representation for the labeler. Use bracketed role tags so the
-    model treats it as data, not as a live conversation it should respond to."""
-    if not turns:
-        return ""
-    user_turns = [t for t in turns if t.role == "user"]
-    asst_turns = [t for t in turns if t.role == "assistant"]
-    picks: list[tuple[str, str]] = []
-    if user_turns:
-        picks.append(("user", user_turns[0].content or ""))
-    if asst_turns:
-        picks.append(("assistant", asst_turns[0].content or ""))
-    if len(asst_turns) > 1 and asst_turns[-1] is not asst_turns[0]:
-        picks.append(("assistant", asst_turns[-1].content or ""))
-    chunks: list[str] = []
-    budget_per = max(200, max_chars // max(1, len(picks)))
-    for role, content in picks:
-        chunks.append(f"[{role}] {content[:budget_per]}")
-    return "TRANSCRIPT:\n" + "\n".join(chunks) + "\nLABEL:"
-
-
-def summarize_intent(turns: list[Turn], *,
-                     backend_kind: str = "auto",
-                     model: str | None = None,
-                     verbose: bool = False) -> str | None:
-    """One-shot LLM call → concise task summary. Returns None if no backend."""
-    try:
-        here = Path(__file__).parent
-        sys.path.insert(0, str(here))
-        from exp_annotator import pick_backend  # type: ignore
-    except ImportError:
-        return None
-    try:
-        backend = pick_backend(backend_kind, model)
-    except SystemExit:
-        return None
-    user_block = _format_for_intent(turns)
-    if not user_block.strip():
-        return None
-    try:
-        raw = backend.call(_INTENT_SYSTEM, user_block)
-    except Exception as e:
-        if verbose:
-            print(f"[intent] summarizer failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
-    if not raw:
-        return None
-    # Take the FIRST non-empty line that looks like a label, strip artifacts.
-    for line in raw.splitlines():
-        cand = line.strip().strip('"').strip("'").strip("「」")
-        # Drop common preamble forms ("Label:", "标签:", "Task:")
-        for prefix in ("LABEL:", "Label:", "label:", "TASK:", "Task:", "task:",
-                       "标签:", "标签：", "任务:", "任务："):
-            if cand.startswith(prefix):
-                cand = cand[len(prefix):].strip()
-        if not cand:
+        matches = _TASK_SUMMARY_RE.findall(str(content))
+        if not matches:
             continue
-        cand = cand.rstrip(".。 ")
-        # Skip if it's the model continuing the conversation (look for
-        # red-flag phrases that mean "model is responding, not labeling")
-        lowered = cand.lower()
-        if any(bad in lowered for bad in ("我在的", "i'm here", "hello", "hi there",
-                                          "抱歉", "不行。", "ok, i'll", "好的，我")):
-            return None
-        if cand == "(no task)" or cand.lower() == "(no task)":
-            return None
-        if len(cand) > 120:
-            cand = cand[:117].rstrip() + "…"
-        return cand
-    return None
+        label = " ".join(matches[-1].strip().split())
+        label = label.strip('"\'`「」『』').strip()
+        if label.endswith(("。", ".", "!", "?", "！", "？", ":", "：")):
+            label = label[:-1].strip()
+        if label and not _looks_bad_title(label):
+            return label[:60] + ("…" if len(label) > 60 else "")
+    return ""
 
 
 def build_lite_card(
@@ -1817,11 +1783,6 @@ def build_lite_card(
     sensitivity: str,
     acl: str,
     tags: list[str],
-    summarize: bool = False,
-    summarizer_backend: str = "auto",
-    summarizer_model: str | None = None,
-    summarize_mode: str = "auto",  # auto | heuristic | llm
-    verbose: bool = False,
 ) -> dict[str, Any]:
     query = ""
     steps: list[str] = []
@@ -1833,54 +1794,34 @@ def build_lite_card(
         body, counts = sanitize(t.content)
         for k, v in counts.items():
             totals[k] = totals.get(k, 0) + v
+        # Recursively scrub tool_calls payloads (arguments dicts often contain
+        # secrets, file paths, query strings). The flat sanitize() above only
+        # handled the role-level `content` string.
+        clean_tool_calls = sanitize_node(t.tool_calls, totals)
         sanitized_traj.append({
             "role": t.role,
             "content": body,
             "ts": t.ts,
-            "tool_calls": t.tool_calls,
+            "tool_calls": clean_tool_calls,
             "tool_result_for": t.tool_result_for,
         })
-        if t.role == "user" and not query and body.strip():
+        if (
+            t.role == "user"
+            and not query
+            and body.strip()
+            and not body.lstrip().startswith((
+                "<environment_context>",
+                "<local-command-caveat>",
+                "<command-message>",
+                "<command-name>",
+            ))
+        ):
             query = body
         elif t.role == "assistant" and body.strip():
             steps.append(body[:280])
             outcome = body
 
-    # Intent priority (cheapest to most expensive):
-    #   1. agent-emitted [task-summary]: line (0 tokens, found in trajectory)
-    #   2. heuristic from first user turn (0 tokens, pure Python)
-    #   3. LLM call (only when mode=auto AND heuristic is degenerate, OR
-    #      mode=llm explicitly)
-    #   4. literal first-user-turn truncation (fallback)
-    summary_intent: str | None = None
-    if summarize:
-        summary_intent = _extract_agent_summary(session.trajectory)
-        if summary_intent and verbose:
-            print("[intent] used agent self-emitted [task-summary] marker", file=sys.stderr)
-
-        if summary_intent is None and summarize_mode in ("auto", "heuristic"):
-            summary_intent = _heuristic_summary(session.trajectory)
-            if summary_intent and verbose:
-                print(f"[intent] heuristic → {summary_intent!r}", file=sys.stderr)
-
-        # Only call the LLM when explicitly requested, OR when mode=auto and
-        # heuristic produced nothing useful (rare).
-        should_call_llm = summarize_mode == "llm" or (
-            summarize_mode == "auto" and summary_intent is None
-        )
-        if should_call_llm:
-            llm_intent = summarize_intent(
-                session.trajectory,
-                backend_kind=summarizer_backend,
-                model=summarizer_model,
-                verbose=verbose,
-            )
-            if llm_intent:
-                summary_intent = llm_intent
-                if verbose:
-                    print(f"[intent] LLM → {llm_intent!r}", file=sys.stderr)
-
-    intent = summary_intent or (query[:120] or "unspecified task").strip()
+    intent = _extract_task_summary_title(sanitized_traj) or _derive_title(query, sanitized_traj)
     return {
         "card": {
             "query": query or "(no user turn)",
@@ -1988,8 +1929,237 @@ def save_credential(cred: dict[str, Any]) -> Path:
 # CLI commands.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Consent — local opt-in/opt-out gate.
+# ---------------------------------------------------------------------------
+
+# exp_consent ships alongside this file in dist-public/. We import it
+# defensively so a corrupted install (consent.py missing) still allows
+# `exp register`, `exp whoami`, etc.
+try:
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in sys.path:
+        sys.path.insert(0, _here)
+    import exp_consent  # type: ignore[import-not-found]
+except Exception as _exc:
+    exp_consent = None  # type: ignore[assignment]
+    _CONSENT_LOAD_ERROR = str(_exc)
+else:
+    _CONSENT_LOAD_ERROR = ""
+
+
+def _consent_check(*, agent: str, cwd: str, session_id: str = "",
+                   force: bool = False, dry_run: bool = False) -> tuple[bool, str, "Any"]:
+    """Single gate every push goes through. Returns (allow, reason, decision).
+
+    `force=True` skips the prompt path (used by `exp push --yes`).
+    `dry_run=True` short-circuits to allow regardless of consent — the
+    caller is responsible for not actually transmitting.
+    """
+    if exp_consent is None:
+        return True, f"consent module unavailable: {_CONSENT_LOAD_ERROR}", None
+    if dry_run:
+        return True, "dry_run", None
+    decision = exp_consent.decide(agent=agent, cwd=cwd, session_id=session_id)
+    if decision.mode == "never":
+        return False, f"never ({decision.reason})", decision
+    if decision.mode == "always" or force:
+        return True, decision.mode, decision
+    if decision.mode == "dry-run":
+        return False, "dry-run mode (saved to pending/)", decision
+    # 'ask' or 'prompt-on-start' — interactive
+    answer = exp_consent.prompt(agent=agent, cwd=cwd, session_id=session_id)
+    if answer == "yes":
+        # Remember decision so re-tries on the same session don't re-ask.
+        if session_id:
+            exp_consent.record_session_override(session_id, "always",
+                                               ttl_seconds=24 * 3600)
+        return True, "user_yes", decision
+    if answer == "never_cwd":
+        exp_consent.set_cwd(cwd, "never", reason="user said never_cwd at prompt")
+        return False, "user_never_cwd", decision
+    if answer == "never_agent":
+        exp_consent.set_agent(agent, "never",
+                              comment="user said never_agent at prompt")
+        return False, "user_never_agent", decision
+    # 'no' or timeout
+    if session_id:
+        exp_consent.record_session_override(session_id, "never",
+                                            ttl_seconds=24 * 3600)
+    return False, "user_no", decision
+
+
+# ---------------------------------------------------------------------------
+# Consent CLI
+# ---------------------------------------------------------------------------
+
+def cmd_consent_show(args: argparse.Namespace) -> int:
+    if exp_consent is None:
+        print(f"consent module unavailable: {_CONSENT_LOAD_ERROR}", file=sys.stderr)
+        return 2
+    data = exp_consent.load_consent()
+    if args.simulate:
+        agent = args.agent or "claude-code"
+        cwd = args.cwd or os.getcwd()
+        print(json.dumps(exp_consent.explain(agent, cwd, args.session or ""),
+                         indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        print(f"\nfile: {exp_consent.CONSENT_PATH}", file=sys.stderr)
+    return 0
+
+
+def cmd_consent_set(args: argparse.Namespace) -> int:
+    if exp_consent is None:
+        print("consent module unavailable", file=sys.stderr)
+        return 2
+    if args.session and args.mode:
+        exp_consent.record_session_override(args.session, args.mode)
+        print(f"[exp] session {args.session} → {args.mode}")
+    elif args.cwd:
+        exp_consent.set_cwd(args.cwd, args.mode, reason=args.reason or "")
+        print(f"[exp] cwd {args.cwd} → {args.mode}")
+    elif args.agent:
+        exp_consent.set_agent(args.agent, args.mode,
+                              default_acl=args.acl or None,
+                              comment=args.reason or "")
+        print(f"[exp] agent {args.agent} → {args.mode}")
+    else:
+        exp_consent.set_global(args.mode)
+        print(f"[exp] global → {args.mode}")
+    return 0
+
+
+def cmd_consent_reset(args: argparse.Namespace) -> int:
+    if exp_consent is None:
+        return 2
+    exp_consent.reset()
+    print("[exp] consent reset to defaults")
+    return 0
+
+
+def cmd_consent_decide(args: argparse.Namespace) -> int:
+    """Used by hook scripts: prints the decision mode (one word) on stdout
+    so shell scripts can `case $(exp consent decide ...) in ...`."""
+    if exp_consent is None:
+        print("ask")  # safe default — let the prompt path run
+        return 0
+    decision = exp_consent.decide(
+        agent=args.agent or "claude-code",
+        cwd=args.cwd or os.getcwd(),
+        session_id=args.session or "",
+    )
+    if args.interactive and decision.mode in ("ask", "prompt-on-start"):
+        # Drive the prompt right here.
+        answer = exp_consent.prompt(
+            agent=args.agent or "claude-code",
+            cwd=args.cwd or os.getcwd(),
+            session_id=args.session or "",
+        )
+        if answer == "yes":
+            print("upload")
+            if args.session:
+                exp_consent.record_session_override(args.session, "always",
+                                                   ttl_seconds=24 * 3600)
+        elif answer == "never_cwd":
+            exp_consent.set_cwd(args.cwd or os.getcwd(), "never",
+                                reason="prompt:never_cwd")
+            print("never")
+        elif answer == "never_agent":
+            exp_consent.set_agent(args.agent or "claude-code", "never",
+                                  comment="prompt:never_agent")
+            print("never")
+        else:
+            print("skip")
+            if args.session:
+                exp_consent.record_session_override(args.session, "never",
+                                                   ttl_seconds=24 * 3600)
+        return 0
+    # Map decide() output to the simple verb the shell expects.
+    print({
+        "always": "upload",
+        "never": "never",
+        "ask": "ask",
+        "prompt-on-start": "ask",
+        "dry-run": "dry-run",
+    }.get(decision.mode, "ask"))
+    return 0
+
+
+def cmd_consent_pending(args: argparse.Namespace) -> int:
+    if exp_consent is None:
+        return 2
+    items = exp_consent.list_pending()
+    if args.prune:
+        removed = exp_consent.prune_pending()
+        print(f"[exp] pruned {removed} pending file(s)")
+        return 0
+    if not items:
+        print("(no pending sessions)")
+        return 0
+    for it in items:
+        print(f"{it['mtime']}  {it['size_bytes']:>8}b  {it['name']}")
+    return 0
+
+
+def cmd_quota(args: argparse.Namespace) -> int:
+    """GET /v1/me/quota — show this agent's publish_count + community
+    unlock state. Useful for users + scripts to check progress."""
+    cred = load_credential()
+    if cred is None:
+        raise SystemExit("no credential found. run `exp_uploader register` first.")
+    res = http_request(args.base, "GET", "/v1/me/quota", cred=cred)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    """POST /v1/lite/publish — publish an experience to the community pool.
+    Strict sanitize (file://, local resources, localhost, UUIDs) runs first;
+    on block the response includes the offending hits + locations."""
+    cred = load_credential()
+    if cred is None:
+        raise SystemExit("no credential found. run `exp_uploader register` first.")
+    res = http_request(
+        args.base, "POST", "/v1/lite/publish",
+        body={"experience_id": args.eid}, cred=cred,
+    )
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+
+def cmd_unpublish(args: argparse.Namespace) -> int:
+    cred = load_credential()
+    if cred is None:
+        raise SystemExit("no credential found. run `exp_uploader register` first.")
+    res = http_request(
+        args.base, "POST", "/v1/lite/unpublish",
+        body={"experience_id": args.eid}, cred=cred,
+    )
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") else 1
+
+
+def cmd_consent_revoke(args: argparse.Namespace) -> int:
+    """Ask the server to revoke a previously uploaded experience.
+
+    The server marks the row revoked=1, deletes the trajectory file,
+    excludes it from search/clusters, and appends an audit_log entry."""
+    cred = load_credential()
+    if cred is None:
+        raise SystemExit("no credential found. run `exp_uploader register` first.")
+    body = {"experience_id": args.eid, "reason": args.reason or "user_request"}
+    res = http_request(
+        args.base, "POST", "/v1/lite/revoke", body=body, cred=cred,
+    )
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("ok") or res.get("status") == "ok" else 1
+
+
 def cmd_register(args: argparse.Namespace) -> int:
-    body = {"name": args.name, "team": args.team}
+    body: dict[str, Any] = {"name": args.name, "team": args.team}
+    if args.owner:
+        body["owner"] = args.owner
     res = http_request(args.base, "POST", "/v1/agents/register", body)
     save_path = save_credential(res)
     res["credentials_path"] = str(save_path)
@@ -2005,6 +2175,86 @@ def cmd_whoami(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps({"agent_name": cred["agent_name"], "secret": "***"}, indent=2))
     return 0
+
+
+def cmd_bind(args: argparse.Namespace) -> int:
+    """Drop a portal-issued credential into place without re-running install.
+
+    Use case: user already has experience-pool installed, then registers (or
+    rotates) at the web portal and gets a bind script. They can either:
+      1. Run the curl one-liner (re-runs install.sh — heavier).
+      2. Run `exp bind --name X --secret Y --team Z` (this command).
+
+    Both end up at the same place: ~/.experience-pool/credentials/X.json
+    written with the supplied secret, and ~/.claude/settings.json env block
+    updated to lock the agent identity.
+    """
+    name = args.name.strip()
+    secret = args.secret.strip()
+    if not name or not secret:
+        print("name + secret are required", file=sys.stderr)
+        return 2
+
+    cred_dir = Path(os.environ.get("EXP_CRED_DIR",
+                                   str(Path.home() / ".experience-pool" / "credentials")))
+    cred_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(cred_dir, 0o700)
+    except OSError:
+        pass
+
+    import uuid as _uuid_mod
+    agent_id = args.agent_id or str(_uuid_mod.uuid4())
+    team = args.team or "default"
+    cred = {"agent_id": agent_id, "agent_name": name, "team": team, "secret": secret}
+    cred_path = cred_dir / f"{name}.json"
+    cred_path.write_text(json.dumps(cred, indent=2))
+    try:
+        os.chmod(cred_path, 0o600)
+    except OSError:
+        pass
+
+    # Patch ~/.claude/settings.json env to lock identity for future sessions.
+    patched_settings = False
+    if not args.skip_claude_settings:
+        settings_path = Path.home() / ".claude" / "settings.json"
+        try:
+            if settings_path.exists():
+                data = json.loads(settings_path.read_text())
+            else:
+                settings_path.parent.mkdir(parents=True, exist_ok=True)
+                data = {}
+            env = data.setdefault("env", {})
+            env["EXP_AGENT_NAME"] = name
+            settings_path.write_text(json.dumps(data, indent=2))
+            patched_settings = True
+        except Exception as exc:
+            print(f"(warning) couldn't patch {settings_path}: {exc}", file=sys.stderr)
+
+    # Smoke-test: hit /v1/users/me-style or /healthz with HMAC to confirm
+    # secret is correct. We use whoami-equivalent: just ensure server is
+    # reachable; any signed request is sufficient.
+    server_ok = False
+    if not args.no_verify:
+        os.environ["EXP_AGENT_NAME"] = name  # ensure load_credential() picks it up
+        try:
+            http_request(args.base, "GET", "/healthz", None)
+            server_ok = True
+        except Exception:
+            server_ok = False
+
+    out = {
+        "status": "bound",
+        "agent_name": name,
+        "agent_id": agent_id,
+        "team": team,
+        "credential_path": str(cred_path),
+        "claude_settings_patched": patched_settings,
+        "server_reachable": server_ok,
+        "base": args.base,
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if server_ok or args.no_verify else 1
 
 
 def cmd_list_sessions(args: argparse.Namespace) -> int:
@@ -2093,28 +2343,70 @@ def _post_rewards(base: str, cred: dict[str, str], experience_id: str,
           file=sys.stderr)
 
 
-def _push_one(session: Session, args: argparse.Namespace,
-              cred: dict[str, str], parent_eid: str | None = None) -> str | None:
-    """Push a single (already-segmented or whole) session. Returns experience_id."""
+def _push(session: Session, args: argparse.Namespace) -> int:
+    cred = load_credential()
+    if cred is None:
+        raise SystemExit("no credential found. run `exp_uploader register` first.")
+
+    # ---- Consent gate ------------------------------------------------
+    # Every actual transmission runs through this. Returns False → skip
+    # upload (optionally save to ~/.experience-pool/pending/ for later).
+    dry_run = bool(getattr(args, "dry_run", False))
+    force = bool(getattr(args, "yes", False))
+    allow, reason, decision = _consent_check(
+        agent=session.agent_type,
+        cwd=session.cwd or "",
+        session_id=session.session_id,
+        force=force,
+        dry_run=dry_run,
+    )
+    if not allow:
+        # Save to pending/ so the user can review + push later.
+        save_pending = (
+            exp_consent is not None
+            and exp_consent.load_consent().get("save_pending_on_skip", True)
+        )
+        pending_path = ""
+        if save_pending and not dry_run:
+            try:
+                snapshot = {
+                    "agent_type": session.agent_type,
+                    "session_id": session.session_id,
+                    "cwd": session.cwd,
+                    "started_at": session.started_at,
+                    "ended_at": session.ended_at,
+                    "skipped_reason": reason,
+                    "trajectory_preview_len": sum(len(t.content or "") for t in session.trajectory),
+                    "turn_count": len(session.trajectory),
+                }
+                pending_path = str(exp_consent.save_pending(
+                    snapshot, session_id=session.session_id
+                ))
+            except Exception as exc:
+                print(f"[exp] pending-save failed: {exc}", file=sys.stderr)
+        print(json.dumps({
+            "session": session.session_id,
+            "agent_type": session.agent_type,
+            "skipped": True,
+            "reason": reason,
+            "pending_saved_to": pending_path,
+        }, ensure_ascii=False))
+        return 0
+    # ------------------------------------------------------------------
+
     if getattr(args, "full_trace", False):
         src = session.extra.get("source_path") or session.extra.get("db") or ""
-        if src and "raw_b64" not in session.extra:
+        if src:
             _maybe_attach_raw(session, src)
     rewards = _maybe_annotate(session, args)
     if rewards is not None:
         session.extra["rewards"] = rewards
-    summarize_flag = not getattr(args, "no_summarize_intent", False)
     parts = build_lite_card(
         session,
         task_type=args.task,
         sensitivity=args.sensitivity,
         acl=args.acl,
         tags=args.tag or [],
-        summarize=summarize_flag,
-        summarize_mode=getattr(args, "summarize_mode", "auto"),
-        summarizer_backend=getattr(args, "summarizer_backend", "auto"),
-        summarizer_model=getattr(args, "summarizer_model", None),
-        verbose=getattr(args, "verbose", False),
     )
     body: dict[str, Any] = {
         **parts["card"],
@@ -2129,12 +2421,9 @@ def _push_one(session: Session, args: argparse.Namespace,
             "cwd": session.cwd,
             "agent_version": session.agent_version,
             "extra": session.extra,
-            "uploader_version": "0.4",
+            "uploader_version": "0.2",
         },
     }
-    if parent_eid:
-        # Server treats this as the segment chain backlink.
-        body["meta"]["parent_experience_ids"] = [parent_eid]
     if body["trajectory"] is None:
         body.pop("trajectory")
     if body["system"] is None:
@@ -2142,51 +2431,22 @@ def _push_one(session: Session, args: argparse.Namespace,
     if body["tools"] is None:
         body.pop("tools")
     res = http_request(args.base, "POST", "/v1/lite/push", body, cred=cred)
-    eid = res.get("experience_id")
-    seg_info = session.extra.get("segment", {})
-    out_line = {
-        "session": session.session_id,
-        "agent_type": session.agent_type,
-        "experience_id": eid,
+    res_min = {
+        "experience_id": res.get("experience_id"),
         "review_status": res.get("review_status"),
+        "sanitization_status": res.get("sanitization_status"),
+        "redactions": res.get("redactions"),
     }
-    if seg_info:
-        out_line["seg"] = f"{seg_info.get('seg_index', 0) + 1}/{seg_info.get('total_segments', 1)}"
-    print(json.dumps(out_line, ensure_ascii=False))
-    if rewards is not None and eid:
+    print(json.dumps({"session": session.session_id, "agent_type": session.agent_type, **res_min},
+                     ensure_ascii=False))
+    # If rewards were just computed, also POST them to /v1/lite/rewards so they
+    # land in turn_rewards (not just in meta.extra). This keeps them
+    # query-able and re-attachable later.
+    if rewards is not None and res.get("experience_id"):
         try:
-            _post_rewards(args.base, cred, eid, rewards)
+            _post_rewards(args.base, cred, res["experience_id"], rewards)
         except SystemExit as e:
             print(f"[rewards] post failed: {e}", file=sys.stderr)
-    return eid
-
-
-def _push(session: Session, args: argparse.Namespace) -> int:
-    cred = load_credential()
-    if cred is None:
-        raise SystemExit("no credential found. run `exp_uploader register` first.")
-    # Decide whether to segment. Default: ON; off when --no-segment or
-    # the trajectory is already short enough to be a single task.
-    do_segment = not getattr(args, "no_segment", False)
-    segments: list[Session]
-    if do_segment:
-        segments = session_to_segments(
-            session,
-            time_gap_minutes=getattr(args, "segment_time_gap_min", _DEFAULT_TIME_GAP_MIN),
-            max_turns=getattr(args, "segment_max_turns", _MAX_TURNS_PER_SEGMENT),
-            enable_keyword=not getattr(args, "no_segment_keyword", False),
-        )
-    else:
-        segments = [session]
-    if len(segments) > 1 and getattr(args, "verbose", False):
-        print(f"[segment] split {session.session_id} into {len(segments)} segments",
-              file=sys.stderr)
-    parent_eid: str | None = None
-    for seg in segments:
-        eid = _push_one(seg, args, cred, parent_eid=parent_eid)
-        # Chain: each segment's parent is the previous segment in the same session.
-        if eid:
-            parent_eid = eid
     return 0
 
 
@@ -2206,51 +2466,6 @@ def cmd_push_latest(args: argparse.Namespace) -> int:
 def cmd_push_file(args: argparse.Namespace) -> int:
     session = GenericAdapter.parse(args.file)
     return _push(session, args)
-
-
-def cmd_export(args: argparse.Namespace) -> int:
-    """Dump normalized sessions to a JSONL file. No server required.
-
-    Useful for offline workflows: hand the JSONL to any downstream pipeline
-    (training data prep, custom analytics, your own ingestion service, etc.).
-    Each line is a full Session payload (the same shape POST /v1/lite/push
-    accepts in its optional `trajectory` + `meta` fields).
-    """
-    enabled_input = args.sources or ",".join(DEFAULT_AUTO_SOURCES)
-    enabled = [s.strip() for s in enabled_input.split(",")
-               if s.strip() and s.strip() in ADAPTERS]
-    out_path = Path(args.output).expanduser()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    n_written = 0
-    failures: list[dict[str, Any]] = []
-    with out_path.open("w", encoding="utf-8") as fp:
-        for src in enabled:
-            adapter = ADAPTERS[src]
-            if not adapter.available():
-                continue
-            rows = adapter.list_sessions(limit=args.limit)
-            for row in rows:
-                if args.since:
-                    when = row.get("mtime") or row.get("ended_at") or ""
-                    if when and when < args.since:
-                        continue
-                ident = row.get("path") or row.get("id")
-                try:
-                    session = _adapter_parse(src, ident)
-                    if not session.trajectory:
-                        continue
-                    fp.write(json.dumps(session.to_payload(), ensure_ascii=False) + "\n")
-                    n_written += 1
-                except Exception as e:
-                    failures.append({"source": src, "id": row.get("id"),
-                                     "error": f"{type(e).__name__}: {e}"})
-    print(json.dumps({"output": str(out_path), "written": n_written,
-                      "sources": enabled, "failed": len(failures)},
-                     ensure_ascii=False))
-    if args.verbose and failures:
-        for f in failures:
-            print(f"  - {f}", file=sys.stderr)
-    return 0 if not failures else 2
 
 
 def cmd_annotate_existing(args: argparse.Namespace) -> int:
@@ -2285,6 +2500,23 @@ def cmd_get_rewards(args: argparse.Namespace) -> int:
     if args.judge_model:
         path += f"?judge_model={urllib.parse.quote(args.judge_model)}"
     res = http_request(args.base, "GET", path, body=None, cred=cred)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Search the ACL-filtered lite pool before starting work."""
+    cred = load_credential()
+    if cred is None:
+        raise SystemExit("no credential found. run `exp_uploader register` first.")
+    body: dict[str, Any] = {
+        "q": args.q,
+        "top_k": args.top_k,
+        "scope": args.scope,
+    }
+    if args.task_type:
+        body["task_type"] = args.task_type
+    res = http_request(args.base, "POST", "/v1/lite/search", body, cred=cred)
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0
 
@@ -2360,17 +2592,6 @@ def cmd_daemon_tick(args: argparse.Namespace) -> int:
         no_trace=False,
         full_trace=False,
         annotate=False,
-        no_segment=os.environ.get("EXP_AUTO_SEGMENT", "1").lower() in {"0", "false", "no"},
-        no_segment_keyword=False,
-        segment_time_gap_min=int(os.environ.get("EXP_SEGMENT_TIME_GAP_MIN", "30")),
-        segment_max_turns=int(os.environ.get("EXP_SEGMENT_MAX_TURNS", "60")),
-        no_summarize_intent=os.environ.get("EXP_AUTO_SUMMARIZE_INTENT", "1").lower() in {"0", "false", "no"},
-        # Daemon defaults to heuristic-only (zero LLM calls). Set
-        # EXP_SUMMARIZE_MODE=llm to force LLM, or =auto to fall back
-        # to LLM only when the heuristic is degenerate.
-        summarize_mode=os.environ.get("EXP_SUMMARIZE_MODE", "heuristic"),
-        summarizer_backend="auto",
-        summarizer_model=None,
         verbose=args.verbose,
     )
     for src in enabled:
@@ -2411,6 +2632,21 @@ def cmd_daemon_tick(args: argparse.Namespace) -> int:
                 session = _adapter_parse(src, ident)
                 if not session.trajectory:
                     skipped += 1
+                    continue
+                # Skip sessions that are obviously title-prober artifacts:
+                # very short and start with our packed-transcript wrapper.
+                first_user = next(
+                    (t.content for t in session.trajectory if t.role == "user"),
+                    "",
+                )
+                if (
+                    len(session.trajectory) < 10
+                    and first_user.lstrip().startswith("<transcript>")
+                ):
+                    skipped += 1
+                    if args.verbose:
+                        print(f"[daemon] {src} {sid[:24]}: skipped (title-prober artifact)",
+                              file=sys.stderr)
                     continue
                 if args.dry_run:
                     print(f"[dry-run] would upload {src}/{sid} ({len(session.trajectory)} turns)")
@@ -2514,10 +2750,29 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("register", help="register agent and save HMAC credential")
     sp.add_argument("--name", required=True)
     sp.add_argument("--team", required=True)
+    sp.add_argument("--owner", default="",
+                    help="stable handle (e.g. github username, email) that "
+                         "groups multiple agents into one personal pool. "
+                         "Defaults to the agent name on first register.")
     sp.set_defaults(func=cmd_register)
 
     sp = sub.add_parser("whoami")
     sp.set_defaults(func=cmd_whoami)
+
+    sp = sub.add_parser("bind",
+                        help="install a portal-issued credential without re-running install.sh")
+    sp.add_argument("--name", required=True,
+                    help="agent_name issued by the portal (e.g. user-alice)")
+    sp.add_argument("--secret", required=True,
+                    help="HMAC secret issued by the portal")
+    sp.add_argument("--agent-id", default="",
+                    help="optional: agent_id from the portal (else random UUID)")
+    sp.add_argument("--team", default="default")
+    sp.add_argument("--skip-claude-settings", action="store_true",
+                    help="don't patch ~/.claude/settings.json env block")
+    sp.add_argument("--no-verify", action="store_true",
+                    help="skip the post-bind /healthz check")
+    sp.set_defaults(func=cmd_bind)
 
     sp = sub.add_parser("list-sessions", help="list recent local sessions for a source")
     sp.add_argument("--source", default="auto", choices=["auto"] + list(ADAPTERS))
@@ -2547,32 +2802,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="cap evaluated turns per session (cost control)")
     push_args.add_argument("--annotate-pick", default="even",
                            choices=["first", "even", "important"])
-    push_args.add_argument("--no-summarize-intent", action="store_true",
-                           help="skip task summary entirely; use literal first "
-                                "user turn (degraded but zero work)")
-    push_args.add_argument("--summarize-mode", default="heuristic",
-                           choices=["auto", "heuristic", "llm"],
-                           help="heuristic (default): zero LLM calls — uses "
-                                "agent's [task-summary] marker if present, "
-                                "else strips greetings from first user turn. "
-                                "auto: heuristic, then LLM only if degenerate. "
-                                "llm: always call LLM (forces extra inference).")
-    push_args.add_argument("--summarizer-backend", default="auto",
-                           choices=["auto", "claude", "anthropic", "openai"])
-    push_args.add_argument("--summarizer-model", default=None,
-                           help="model id for LLM fallback (default haiku)")
-    push_args.add_argument("--no-segment", action="store_true",
-                           help="upload the whole session as one experience "
-                                "(default is to segment by topic shifts / time gaps)")
-    push_args.add_argument("--no-segment-keyword", action="store_true",
-                           help="disable keyword-based topic-shift detection "
-                                "(time gap + length cap still active)")
-    push_args.add_argument("--segment-time-gap-min", type=int, default=30,
-                           help="minutes of inactivity between turns that triggers a split")
-    push_args.add_argument("--segment-max-turns", type=int, default=60,
-                           help="hard cap: any segment > this many turns force-splits "
-                                "at the next user-turn boundary")
     push_args.add_argument("--verbose", "-v", action="store_true")
+    push_args.add_argument("--yes", "-y", action="store_true",
+                           help="bypass the consent prompt; treat decision as 'always'")
+    push_args.add_argument("--dry-run", action="store_true",
+                           help="run sanitize + structure but do NOT transmit; "
+                                "save preview to ~/.experience-pool/pending/")
 
     sp = sub.add_parser("push", parents=[push_args])
     sp.add_argument("--session", required=True, help="session id, prefix, or path")
@@ -2596,21 +2831,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file", required=True)
     sp.set_defaults(func=cmd_push_file)
 
-    sp = sub.add_parser(
-        "export",
-        help="dump normalized sessions to JSONL (no server required) — "
-             "the universal use case when you don't run the reference gateway")
-    sp.add_argument("--output", default="./sessions.jsonl",
-                    help="output JSONL path (default ./sessions.jsonl)")
-    sp.add_argument("--sources", default="",
-                    help="comma-sep adapter names (default: all auto-sync sources)")
-    sp.add_argument("--limit", type=int, default=200,
-                    help="max sessions per source (default 200)")
-    sp.add_argument("--since", default="",
-                    help="ISO date prefix; only newer sessions exported")
-    sp.add_argument("--verbose", "-v", action="store_true")
-    sp.set_defaults(func=cmd_export)
-
     sp = sub.add_parser("annotate-existing", parents=[push_args],
                         help="re-annotate an already-uploaded trace and POST rewards")
     sp.add_argument("--experience-id", required=True,
@@ -2624,6 +2844,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--experience-id", required=True)
     sp.add_argument("--judge-model", default=None)
     sp.set_defaults(func=cmd_get_rewards)
+
+    sp = sub.add_parser("search", help="ACL-filtered vector search before starting work")
+    sp.add_argument("--q", required=True, help="query / task description")
+    sp.add_argument("--top-k", type=int, default=5)
+    sp.add_argument("--task-type", default="")
+    sp.add_argument("--scope", default="auto", choices=["auto", "personal", "community"],
+                    help="auto = personal plus community if unlocked")
+    sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("daemon-tick",
                         help="one-shot incremental sync of new sessions across all enabled sources")
@@ -2646,6 +2874,71 @@ def build_parser() -> argparse.ArgumentParser:
                         help="forget what we've uploaded; next tick re-scans from scratch")
     sp.add_argument("--source", default="", help="reset only this source (default: all)")
     sp.set_defaults(func=cmd_daemon_reset)
+
+    # ------------------------------------------------------------------
+    # Consent subcommands — local opt-in/opt-out (consent.json).
+    # ------------------------------------------------------------------
+    consent = sub.add_parser("consent", help="manage local upload consent (consent.json)")
+    csub = consent.add_subparsers(dest="consent_cmd", required=True)
+
+    sp = csub.add_parser("show", help="print consent.json (or simulate a decision)")
+    sp.add_argument("--simulate", action="store_true",
+                    help="instead of dumping consent.json, run decide() for the args")
+    sp.add_argument("--agent", default="")
+    sp.add_argument("--cwd", default="")
+    sp.add_argument("--session", default="")
+    sp.set_defaults(func=cmd_consent_show)
+
+    sp = csub.add_parser("set", help="set a consent rule (global / agent / cwd / session)")
+    sp.add_argument("--mode", required=True, choices=["always", "never", "ask",
+                                                       "prompt-on-start", "dry-run"])
+    sp.add_argument("--agent", default="", help="apply rule to this agent only")
+    sp.add_argument("--cwd", default="", help="apply rule to this cwd glob (e.g. ~/work/**)")
+    sp.add_argument("--session", default="", help="apply rule to this session id")
+    sp.add_argument("--reason", default="", help="audit comment")
+    sp.add_argument("--acl", default="", help="default ACL for the rule (agent only)")
+    sp.set_defaults(func=cmd_consent_set)
+
+    sp = csub.add_parser("reset", help="reset consent.json to defaults")
+    sp.set_defaults(func=cmd_consent_reset)
+
+    sp = csub.add_parser("decide",
+                         help="print the decision for (agent,cwd,session) — used by hook scripts")
+    sp.add_argument("--agent", default="claude-code")
+    sp.add_argument("--cwd", default="")
+    sp.add_argument("--session", default="")
+    sp.add_argument("--interactive", action="store_true",
+                    help="if mode=='ask', drive the prompt and emit the answer")
+    sp.set_defaults(func=cmd_consent_decide)
+
+    sp = csub.add_parser("pending", help="list (or prune) skipped sessions saved locally")
+    sp.add_argument("--prune", action="store_true",
+                    help="apply the cap+TTL pruning rules now and exit")
+    sp.set_defaults(func=cmd_consent_pending)
+
+    sp = csub.add_parser("revoke", help="ask the server to delete an uploaded experience")
+    sp.add_argument("--eid", required=True, help="experience_id to revoke")
+    sp.add_argument("--reason", default="user_request")
+    sp.set_defaults(func=cmd_consent_revoke)
+
+    # ------------------------------------------------------------------
+    # Personal vs. community pool — publish / unpublish / quota
+    # ------------------------------------------------------------------
+    sp = sub.add_parser("quota",
+                        help="show your community-pool publish_count and unlock state")
+    sp.set_defaults(func=cmd_quota)
+
+    sp = sub.add_parser("publish",
+                        help="publish a private experience to the community pool "
+                             "(runs strict sanitize first)")
+    sp.add_argument("--eid", required=True, help="experience_id to publish")
+    sp.set_defaults(func=cmd_publish)
+
+    sp = sub.add_parser("unpublish",
+                        help="drop a published experience back to private "
+                             "(publish_count is NOT decremented)")
+    sp.add_argument("--eid", required=True, help="experience_id to unpublish")
+    sp.set_defaults(func=cmd_unpublish)
 
     return p
 

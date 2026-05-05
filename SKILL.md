@@ -1,6 +1,6 @@
 ---
 name: experience-pool
-description: General-purpose agent session trace collector. Auto-detects sessions from Claude Code, Hermes, Cursor, agents-chat, Continue.dev, Codex, Aider, Open Interpreter, or any OpenAI/Anthropic-shaped messages JSON; normalizes them into a canonical {trajectory, model, agent_type, ...} schema; optionally annotates per-turn rewards (Synergy-style 5-dim × {-1,0,+1} + confidence). Output target is pluggable — dump to local JSONL for any downstream pipeline, or HMAC-upload to a configurable gateway.
+description: General-purpose agent session trace collector. Auto-detects sessions from Claude Code, Hermes, Cursor, agents-chat, Continue.dev, Codex, Aider, Open Interpreter, or any OpenAI/Anthropic-shaped messages JSON; normalizes them into a canonical {trajectory, model, agent_type, ...} schema; optionally annotates per-turn rewards (Synergy-style 5-dim × {-1,0,+1} + confidence); HMAC-uploads to a configurable Experience Pool gateway with ACL-filtered search.
 version: 0.4.0
 license: MIT
 homepage: https://github.com/xhh678876/experience-pool-skill
@@ -10,7 +10,6 @@ triggers:
   - lookup playbook
   - upload trajectory
   - record what worked
-  - export sessions
   - score this trace
   - annotate rewards
   - collect agent traces
@@ -18,15 +17,18 @@ triggers:
 
 # experience-pool
 
-A **portable trace collector** for any agent framework. The output target is
-yours to choose:
+A **portable trace collector** for any agent framework. The default target is
+an HMAC-compatible Experience Pool gateway:
 
-- **Local-only mode** (no server needed) — `exp export --output sessions.jsonl`
-  dumps normalized sessions to disk so any downstream pipeline (training data
-  prep, custom analytics, your own ingestion service) can consume them.
 - **Gateway upload mode** — point at any HMAC-compatible Experience Pool
   server with `EXP_BASE_URL=...`. The reference public gateway is
   `https://expool.clawsii.com`, but self-hosting is a `docker compose up`.
+- **Private backfill mode** — use `session-extractor/` to bulk-upload local
+  Claude Code / Codex / Hermes history with `acl=private` hardcoded.
+
+For the intranet upload contract, HMAC signing rules, LiteCard fields, ACL,
+batch backfill, and troubleshooting, read
+`docs/UPLOAD_LOGIC_AND_MANUAL.md`.
 
 ## First-run bootstrap (read this first)
 
@@ -62,7 +64,7 @@ EXP_SKIP_HOOK=1 EXP_SKIP_DAEMON=1 bash scripts/install.sh
 
 | Goal | Command |
 |---|---|
-| Just dump traces, no server | `exp export --output sessions.jsonl --since 2026-04-01` |
+| Inspect local sessions | `exp list-sessions --source auto` |
 | Send to your own gateway | `EXP_BASE_URL=https://your.host/  exp register --name x --team y` then `exp push-latest` |
 | Use the public reference pool | `curl -sSL https://expool.clawsii.com/install \| bash` |
 
@@ -91,9 +93,7 @@ agent framework" cases just work via `exp push-file --file traj.json`.
 exp whoami
 exp daemon-state                          # what's been synced per source
 exp list-sessions --source hermes -v
-
-# Export (no server)
-exp export --output ./traces.jsonl --since 2026-04-01
+exp search --q "FastAPI HMAC 签名失败" --top-k 5
 
 # Manual push
 exp push --session <id-or-prefix> --acl team:platform
@@ -130,6 +130,10 @@ Backends (auto-fallback): `claude` CLI · Anthropic API · OpenAI-compat
 
 - Client-side regex sweep before upload: Anthropic / OpenAI / Stripe / GitHub /
   AWS keys, URL credentials, email, IPv4
+- Portal bind mode writes a per-user HMAC credential locally and never embeds
+  real secrets in this repository
+- `session-extractor/` is private-only by design: its upload body always uses
+  `acl=private`
 - ACL is per-experience: `private` | `team:<name>` | `public` (default
   `private` for the auto-uploader; override with `EXP_AUTO_ACL`)
 - Per-source toggle: `EXP_AUTO_SOURCES=claude-code,hermes,...`
