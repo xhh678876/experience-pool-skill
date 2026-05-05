@@ -1,143 +1,153 @@
-# experience-pool agent contract
+# experience-pool agent contract(创智内网版)
 
-You have access to your team's shared **experience pool** through the
-`exp` CLI at `~/.experience-pool/bin/exp` (or `EXP_BIN` env var). The pool
-stores past task trajectories from every agent on the intranet, ranked by
-quality, and lets you search before starting work + automatically capture
-your own work after finishing.
+你接入了创智内网的共享经验池。命令行接口在 `~/.experience-pool/bin/exp`
+(或 `EXP_BIN` 环境变量),网关地址默认 `http://10.244.66.195:3080`,门户
+`/me` 页用 `xxx@sii.edu.cn` 邮箱登录管理。
 
-This file is your contract for using it. The user **already opted in** by
-running the bind command, so default behavior is **upload to their private
-repo + notify**, not ask-each-time. They can revoke individual uploads
-anytime at the portal `/me` page.
+经验池存了所有 agent 的过去任务轨迹(按质量排序)。这个契约规定了你应该
+怎么用它:**任务开始前先 search 同类做法,任务结束后自动归档你自己的工作**。
 
----
-
-## 0. Session start — ANNOUNCE the auto-upload behavior (REQUIRED)
-
-The **very first user-facing message** of every session must include a
-short one-line notice that the experience pool is active:
-
-> "📥 connected to experience pool — tasks in this session will
->  auto-upload to your private repo. Type 'don't upload' to opt out."
-
-Place this BEFORE answering the user's first question, on its own line,
-or merged into your greeting if you have one. Do not skip this — it's
-how the user discovers (and stays aware of) the auto-upload behavior.
-After the first message of the session, do not repeat the notice
-unless the user asks.
+用户已经在 `/me` 页跑过 bind 命令——所以默认是**「自动上传到本人 private 库 + 通知用户」**,
+不是「每次都问」。用户想撤回某条上传,在 `/me` 自己点撤回,你不用代劳。
 
 ---
 
-## 1. Before starting a non-trivial task — SEARCH
+## 0. 会话开始 —— 通告自动上传(必做)
 
-When the user asks for something that smells solved-before (debugging a
-familiar tool, integrating a known service, repeating a class of work),
-search the pool **before** writing your plan:
+**每个 session 的第一条对用户回复**必须包含一行:
+
+> "📥 connected to experience pool —— tasks in this session will auto-upload
+> to your private repo. Type 'don't upload' to opt out."
+
+或中文等价:
+
+> "📥 已接入经验池 —— 本会话的任务会自动归档到你的 private 库。
+> 想关掉就说 '不要上传'。"
+
+这一行放在第一条回复**最前面**,单独一行,在你回答用户之前。**不能跳过**——
+这是用户感知到上传行为的唯一入口。会话第一条之后就别再重复,除非用户问起。
+
+---
+
+## 1. 任务开始前 —— SEARCH
+
+用户提的问题如果听上去**做过类似的**(调试一个熟悉的工具、对接一个已知服务、
+重复某类工作),**先搜**:
 
 ```bash
-~/.experience-pool/bin/exp search --q "<one-line task description>" --top-k 5
+~/.experience-pool/bin/exp search --q "<一行任务描述>" --top-k 5
 ```
 
-Each result is a card with `intent`, `script_steps`, `pitfalls`, and a
-`q_scalar` quality score. **Read the top hit** — if it's relevant, adopt
-the script and mention it in your reply ("I'm reusing the approach from
-experience XX, which solved this last week"). Don't paste raw JSON to
-the user; summarize.
+每条结果是一张卡片,带 `intent`、`script_steps`、`pitfalls`、`q_scalar` 质量分。
+**读 top hit**——如果跟当前任务相关,就采纳那个 script,在你的回复里**点出来**:
+"我复用了上周一条经验里的方案,核心步骤是 …"。
 
-Reusable distilled skills are handled by the full Experience Pool CLI when
-that product surface is enabled. The lightweight `exp` installed by this
-skill focuses on experience search, upload, revoke, publish, and rewards.
+不要把原始 JSON 贴给用户。要总结。
 
 ---
 
-## 2. After EACH task boundary — UPLOAD by default + NOTIFY
+## 2. 每个任务边界 —— 默认上传 + 通知
 
-Tasks are **chunked**, not one-per-session. Recognize boundaries:
+任务是**按主题切的**,不是一个 session 一个任务。识别边界:
 
-- **Task START** — user asks for a new deliverable, switches topic, or
-  begins a new investigation
-- **Task END** — you finish the deliverable AND the user has seen the
-  result (i.e. you've sent the message that wraps it). Other end signals:
-  "done" / "looks good" / "perfect" / "把这段总结上传" / "保存一下" /
-  "share this" / "thanks" (followed by topic switch)
+- **任务开始**:用户提了一个新交付物 / 切换主题 / 开始新调查
+- **任务结束**:你完成了交付物 *并且* 用户已经看到了结果(也就是收尾的那条
+  回复已经发出去了)。其它结束信号:`done` / `looks good` / `perfect` /
+  `保存一下` / `把这段总结上传` / `share this` / `thanks`(后接主题切换)
 
-When a task ENDS, immediately:
+任务结束的那一刻,立刻按顺序做三件事:
 
-**Step A** — print a `[task-summary]: <one line>` marker line — this
-helps the server-side segmenter split long sessions into independent
-records, plus signals you've recognized the boundary.
+**步骤 A** —— 在收尾回复里加一行 `[task-summary]: <一行>`。这行有两个作用:
+(1) 帮服务端把长 session 切成独立片段;(2) 等于你向系统宣告「我识别到一个任务边界」。
 
-**Step B — UPLOAD silently to the user's private repo.** Don't ask first.
-The user opted in already. Pick reasonable defaults:
+格式:`[task-summary]: <动词 + 对象,≤80 char,匹配用户语言>`,例:
+
+```text
+[task-summary]: 排查 FastAPI HMAC 签名失败的原因并修复 client 签名 body
+[task-summary]: Translate project README from Chinese to English
+[task-summary]: 部署 OPF 服务到独立 GPU 机器
+```
+
+**步骤 B** —— **静默上传到用户 private 库**,不要再问:
 
 ```bash
 ~/.experience-pool/bin/exp push-latest --yes \
   --source <agent-runtime>          # claude-code | cursor | codex | hermes | openclaw
-  --task <task-type>                # one-liner you classify (see §3)
-  --sensitivity medium              # bump to 'high' if credentials/PII/security-sensitive
-  --acl private                     # default. Never escalate without explicit ask.
+  --task <task-type>                # 一句 kebab-case 分类(见 §4)
+  --sensitivity medium              # 触及凭据 / PII / 安全敏感 → bump 'high'
+  --acl private                     # 默认 private,**绝对不**在没显式授权时升级
 ```
 
-The push runs through Layer 1 sanitizer (regex) on the server. OPF
-(deeper privacy filter) is queued for later — it's fine to ship now.
+push 走服务端 Layer 1 正则脱敏(始终);Layer 2 OPF(深度隐私过滤)是 defer 到
+后台 worker 的——你不用管,直接发就行。
 
-**Step C — NOTIFY the user, brief and actionable, on its own line:**
+**步骤 C** —— **单独一行通知用户**(简短可操作):
 
 > "📤 uploaded as `<id8>` (task=`<task>`, acl=private) — `/me` to revoke"
 
-Don't paste raw JSON. Use the short id (first 8 chars of experience_id).
-Don't ask permission, don't elaborate — one line, then move on.
+不要贴原始 JSON。`<id8>` 是 `experience_id` 的前 8 字符。不要解释,不要改成长篇大论,
+一行,然后切下一个任务。
 
-The CLI itself dedupes by content fingerprint per-agent: if you push the
-same trajectory twice, the second call returns the existing experience_id
-without creating a duplicate row. So calling push at every task boundary
-is safe even if some boundaries overlap.
-
----
-
-## 3. When to ASK first instead of upload-and-notify
-
-These are the only cases where you SHOULD ask before upload:
-
-- **Sensitivity = high** that you suspect — credentials, customer data,
-  security review, exploit details, internal infra topology. Ask:
-  *"This work touched <X>; want me to upload as `private` or skip?"*
-- **User wants `team:NAME` or `public` ACL.** Default is private. Any
-  escalation MUST be explicit user ask + clear yes.
-- **User pre-emptively said "don't upload this"** earlier in session →
-  honor it for the rest of the session, no upload.
+按内容指纹去重(per-agent 作用域)——同一份 trajectory push 两次,第二次返回
+**同一个** `experience_id`,不会污染池子。所以即使你判错了任务边界(多 push 了一次),
+也是安全的。
 
 ---
 
-## 4. Picking task / sensitivity / acl
+## 3. 什么时候应该**先问后传**
 
-**`--task`** is a short kebab-case classifier. Examples: `debugging`,
-`code-review`, `infra-setup`, `data-analysis`, `learning`, `api-integration`,
-`refactor`, `incident-response`. Pick the one closest fit; if you'd guess a
-new category, use it.
+只有这三种情况:
+
+- **你判断 sensitivity 应该是 `high`** —— 凭据、客户数据、安全 review、漏洞细节、
+  内部基础设施拓扑。问:
+  *"这次任务涉及 <X>;要传成 `private` 还是跳过?"*
+- **用户想要 `team:NAME` 或 `public` ACL** —— 默认 private。任何升级**必须**有用户的
+  明确请求 + 明确同意。
+- **用户在 session 里说过 "不要上传"** —— 整个 session 剩下的任务都不要上传,
+  哪怕用户后来又干了别的事。
+
+---
+
+## 4. 选 `--task` / `--sensitivity` / `--acl`
+
+**`--task`** 短的 kebab-case 分类。例:`debugging`、`code-review`、`infra-setup`、
+`data-analysis`、`learning`、`api-integration`、`refactor`、`incident-response`。
+就近选一个;觉得需要新类别就用,不用受现有 enum 限制。
 
 **`--sensitivity`**:
-- `low` — public docs, OSS code, generic discussion
-- `medium` (default) — internal but non-secret work
-- `high` — anything touching credentials, customer data, security review,
-  exploits, internal infra topology
+
+- `low` —— 公开文档、OSS 代码、通用讨论
+- `medium`(默认)—— 内部但非机密
+- `high` —— 触及凭据 / 客户数据 / 安全 review / 漏洞 / 内部拓扑
 
 **`--acl`**:
-- `private` (default) — only this user sees it
-- `team:<name>` — explicit user opt-in only
-- `public` — explicit user opt-in only
+
+- `private`(默认)—— 只有这个用户自己看得到
+- `team:<name>` —— **必须**用户显式 opt-in
+- `public` —— **必须**用户显式 opt-in
 
 ---
 
-## 5. Hard rules
+## 5. 硬规则
 
-- **Default upload to private**, but **always notify** with the
-  experience_id and revoke command.
-- **Never escalate ACL** beyond `private` without explicit user opt-in.
-- **Never paste full secrets / tokens / keys** — sanitizer is best-effort.
-- **If the user said "don't upload" in this session**, honor it — don't
-  upload anything else from this session even if you finish more tasks.
-- **If the trajectory contains the user's mistake-and-recovery**, that's
-  high-value — mention it in the notification so they know it's worth
-  keeping vs revoking.
+- **默认 `private` 上传 + 总是通知**(experience_id + 撤回方式)
+- **绝对不**在没显式 opt-in 的情况下升级 ACL
+- **绝对不**复述完整 secret / token / key——脱敏是 best-effort,不是兜底
+- **如果用户在 session 里说过"不要上传"**,这个 session 剩下的任务一概不要上传,
+  即使你后续完成了其它事
+- **如果 trajectory 里有用户的"翻车 + 自救"过程**,那是高价值的——在通知里点出来,
+  让用户知道这条值得保留 vs 撤掉
+
+---
+
+## 6. 快速排错(给自己用)
+
+| 现象 | 看哪 |
+|---|---|
+| `exp whoami` 报 no credential | 没 bind / `EXP_AGENT_NAME` 错了 |
+| `401 bad signature` | secret 跟 server 不匹配 |
+| 上传后标题显示成 `<transcript>` 或整段对话 | 用 `[task-summary]: …` 接管,别让 LLM 自己总结 |
+| 撤回后再传被指纹挡住 | 在 `/me` 页二次确认或让用户手动报告 |
+
+完整文档在 `~/.experience-pool/bin/agent-contract.md` 旁边的 `UPLOAD_LOGIC_AND_MANUAL.md`,
+或者 `http://10.244.66.195:3080/session-extractor/README.md`。

@@ -1,191 +1,218 @@
 ---
 name: experience-pool
-description: General-purpose agent session trace collector. Auto-detects sessions from Claude Code, Hermes, Cursor, agents-chat, Continue.dev, Codex, Aider, Open Interpreter, or any OpenAI/Anthropic-shaped messages JSON; normalizes them into a canonical {trajectory, model, agent_type, ...} schema; optionally annotates per-turn rewards (Synergy-style 5-dim × {-1,0,+1} + confidence); HMAC-uploads to a configurable Experience Pool gateway with ACL-filtered search.
-version: 0.4.0
+description: 创智内网共享经验池接入 skill。每次任务结束自动把会话轨迹脱敏后归档到本人 private 库;开始新任务前可先 search 同类问题的关键步骤。支持 Claude Code / Cursor / Codex / Hermes / OpenClaw / agents-chat,以及任意 OpenAI / Anthropic 形状的 messages JSON。HMAC 签名 + per-user ACL,默认 private。
+version: 0.5.0
 license: MIT
-homepage: https://github.com/xhh678876/experience-pool-skill
+homepage: http://10.244.66.195:3080
 triggers:
-  - share experience
-  - learn from past
-  - lookup playbook
+  - 上传经验
+  - 共享经验
+  - 查找同类做法
+  - search experience pool
   - upload trajectory
   - record what worked
-  - score this trace
-  - annotate rewards
-  - collect agent traces
+  - 这次任务做完了
 ---
 
-# experience-pool
+# experience-pool(创智内网版)
 
-A **portable trace collector** for any agent framework. The default target is
-an HMAC-compatible Experience Pool gateway:
+把多 agent 的会话轨迹归档到 sii.edu.cn 内网共享经验池。
 
-- **Gateway upload mode** — point at any HMAC-compatible Experience Pool
-  server with `EXP_BASE_URL=...`. The reference public gateway is
-  `https://expool.clawsii.com`, but self-hosting is a `docker compose up`.
-- **Private backfill mode** — use `session-extractor/` to bulk-upload local
-  Claude Code / Codex / Hermes history with `acl=private` hardcoded.
+## 内网当前部署
 
-For the intranet upload contract, HMAC signing rules, LiteCard fields, ACL,
-batch backfill, and troubleshooting, read
-`docs/UPLOAD_LOGIC_AND_MANUAL.md`.
+| 用途 | 地址 |
+|---|---|
+| Gateway / 入口 | `http://10.244.66.195:3080` |
+| 门户(注册 / 登录 / `/me`) | `http://10.244.66.195:3080/login` |
+| FastAPI(只内网) | `http://10.244.66.195:8081` |
+| OPF 深度脱敏(独立 GPU) | `http://10.245.4.167:8085` |
 
-## First-run bootstrap (read this first)
+## 文档导航
 
-If `~/.experience-pool/credentials/` does not exist on this machine, this
-skill is **not yet wired**. The very first thing to do when invoked is:
+- **[`docs/UPLOAD_LOGIC_AND_MANUAL.md`](docs/UPLOAD_LOGIC_AND_MANUAL.md)** —— 上传契约、HMAC 签名、LiteCard 字段、ACL、批量回填、踩坑、检查清单
+- **[`docs/SANITIZATION.md`](docs/SANITIZATION.md)** —— 四层脱敏管道(L0 客户端正则 → L1 服务端正则 → L2 OPF 深度 → L3 LLM 判定 + strict-public 发布审查),每条规则抓什么、漏什么、怎么改
+- [`agent-contract.md`](agent-contract.md) —— 给 agent 看的行为契约(任务结束自动上传 + 通知用户的格式)
+
+## 第一次用(本机首次接入)
+
+1. 浏览器打开 `http://10.244.66.195:3080/login`,用 `xxx@sii.edu.cn` 邮箱注册 / 登录
+2. 进 `/me` 页,复制「绑定本机」面板的 curl 一行
+3. 终端粘贴:
 
 ```bash
-bash "$(dirname "$0")/scripts/install.sh"
-# or, when bootstrapped from the public gateway:
-curl -sSL https://expool.clawsii.com/install | bash
+curl -sSL http://10.244.66.195:3080/install | \
+  EXP_AGENT_NAME='user-xxx' \
+  EXP_AGENT_SECRET='<portal-issued-secret>' \
+  EXP_BASE_URL='http://10.244.66.195:3080' \
+  bash
 ```
 
-The installer (idempotent — safe to re-run) does five things:
+`install.sh` 是幂等的,重复跑安全。它会做 6 件事:
 
-1. Drops `exp_uploader.py` + `exp_annotator.py` under `~/.experience-pool/bin/`
-   (uses local copies if you git-cloned this repo, falls back to network)
-2. Registers an HMAC credential for this host
-3. Adds a Claude Code `Stop` hook so finished Claude sessions upload instantly
-4. Installs a launchd LaunchAgent (macOS) or systemd user timer (Linux) that
-   runs `exp daemon-tick` every 2 minutes — the universal coverage for
-   non–Claude-Code agents
-5. Runs one tick immediately to upload backlog
+1. 装 `exp_uploader.py` / `exp_consent.py` / `exp_annotator.py` 到 `~/.experience-pool/bin/`
+2. 写凭据到 `~/.experience-pool/credentials/<name>.json`(0600)
+3. 检测本机 agent runtime(claude-code / cursor / codex / hermes / openclaw),把
+   `agent-contract.md` 分发到对应位置(下面一节列了)
+4. 给 Claude Code 写 `SessionEnd` + `SessionStart` hook,旧实验性 hook 会被识别清掉
+5. 装 systemd user timer(Linux)或 launchd LaunchAgent(macOS),每 120s 跑一次
+   `daemon-tick` 当兜底
+6. **不**自动批量回填(怕用户没意识到突然传了一堆)。要回填:
+   `bash ~/.experience-pool/run-backfill.sh &`,或在 `/me` 用「批量回填」面板
 
-After that the skill is "set and forget" for every supported agent.
-
-Skip auto-config (manual `exp` only):
+只想要 CLI、不要 hook 和 daemon:
 
 ```bash
 EXP_SKIP_HOOK=1 EXP_SKIP_DAEMON=1 bash scripts/install.sh
 ```
 
-## Three usage shapes
+## 三种使用形态
 
-| Goal | Command |
+| 目的 | 命令 |
 |---|---|
-| Inspect local sessions | `exp list-sessions --source auto` |
-| Send to your own gateway | `EXP_BASE_URL=https://your.host/  exp register --name x --team y` then `exp push-latest` |
-| Use the public reference pool | `curl -sSL https://expool.clawsii.com/install \| bash` |
+| 看本机有哪些 session | `exp list-sessions --source auto` |
+| 手动上传当前最新 session | `exp push-latest --yes` |
+| 搜索经验 | `exp search --q "<问题>" --top-k 5` |
+| 批量回填本机历史 | `bash ~/.experience-pool/run-backfill.sh &` |
+| 一台新机器零依赖回填 | 见 `session-extractor/`(模式 C) |
 
-## Supported agents (auto-detected)
+## 支持的 agent runtime
 
-| Source | Storage | Auto-sync default |
+| Source | 存储位置 | 自动同步 |
 |---|---|---|
-| Claude Code (+ OpenClaw forks) | `~/.claude/projects/**/*.jsonl` | Stop hook (instant) + daemon |
-| Hermes Agent | `~/.hermes/sessions/*.json[l]` | daemon |
-| agents-chat | `~/agents-chat/messages.db` (SQLite by `thread_id`) | daemon |
-| Continue.dev | `~/.continue/sessions/*.json` | daemon |
-| Codex CLI | `~/.codex/sessions/**` | daemon |
-| Cursor | `~/Library/.../Cursor/User/**/state.vscdb` | manual |
-| Aider | `<cwd>/.aider.chat.history.md` | manual |
-| Open Interpreter | profile dir | manual |
-| Generic JSON | any `{messages|trajectory|history|chat_history|runs}` shape | `exp push-file` |
+| Claude Code(+ OpenClaw 分支) | `~/.claude/projects/**/*.jsonl` | SessionEnd hook(任务结束) + daemon 兜底 |
+| Hermes | `~/.hermes/sessions/*.json[l]` | daemon(2 min) |
+| agents-chat | `~/agents-chat/messages.db`(SQLite by `thread_id`) | daemon(2 min) |
+| Continue.dev | `~/.continue/sessions/*.json` | daemon(2 min) |
+| Codex CLI | `~/.codex/sessions/**` | daemon(2 min) |
+| Cursor | `~/Library/.../Cursor/User/**/state.vscdb` | 手动 `exp push` |
+| Aider | `<cwd>/.aider.chat.history.md` | 手动 |
+| Open Interpreter | profile 目录 | 手动 |
+| 任意 JSON | `{messages|trajectory|history|chat_history|runs}` 形状 | `exp push-file` |
 
-The generic adapter recognizes OpenAI / Anthropic / LangChain / AutoGen /
-CrewAI / LangSmith request dump shapes — so most "I have a JSON file from my
-agent framework" cases just work via `exp push-file --file traj.json`.
+generic adapter 认识 OpenAI / Anthropic / LangChain / AutoGen / CrewAI / LangSmith
+的请求 dump 形状。
 
-## Common operations
+## 常用命令
 
 ```bash
-# State + sanity
+# 状态 + 自检
 exp whoami
-exp daemon-state                          # what's been synced per source
+exp daemon-state                          # 看每个 source 同步到哪
 exp list-sessions --source hermes -v
 exp search --q "FastAPI HMAC 签名失败" --top-k 5
 
-# Manual push
+# 手动 push
 exp push --session <id-or-prefix> --acl team:platform
-exp push-latest                           # most recent session of detected source
+exp push-latest                           # 当前 source 最新的一条
 exp push-all --source hermes --since 2026-04-01
 
-# Generic file
+# 任意 JSON
 exp push-file --file traj.json --task csv_analysis --acl public
 
-# Reward annotation (per-turn, Synergy schema)
+# 评分(可选)
 exp push --session <id> --annotate --annotate-model claude-haiku-4-5
 exp annotate-existing --experience-id <eid> --session <local-id>
 exp get-rewards --experience-id <eid>
 ```
 
-## Reward annotation (optional)
+## 隐私(脱敏)
 
-Per-turn 5-dimensional scores using the
-[Synergy reward schema](https://github.com/SII-Holos/synergy/blob/main/packages/synergy/src/agent/prompt/reward.txt):
-`outcome / intent / execution / orchestration / expression`, each in
-`{-1, 0, +1}`, plus `confidence ∈ [0, 1]` and `reason`.
+四层防线,详见 [`docs/SANITIZATION.md`](docs/SANITIZATION.md):
 
-The judge sees three sections per evaluated turn:
+| 层 | 什么时候 | 抓什么 |
+|---|---|---|
+| **L0 客户端正则** | 上传前在本机 | Anthropic / OpenAI / GitHub / AWS / Stripe / Slack key、URL credentials、邮箱、手机号、身份证、IPv4、home path 用户名等 |
+| **L1 服务端正则** | 每次 push,始终 | 同 L0(双保险) |
+| **L2 OPF 深度脱敏** | 服务端 defer 到 worker(GPU 远程) | 8 类标准 PII —— 散在自由文本里的人名、地址、机构名、SSN、医疗记录等 |
+| **L3 LLM 商业敏感判定** | 仅 L1 高严重度命中时 | "这条 trace 是不是涉及商业机密 / 安全敏感",决定是否上人工审 |
 
-- `<user>` — the user request
-- `<assistant>` — the assistant response (text + `[Tool: name]` calls)
-- `<subsequent>` — next K turns; this is the **delayed feedback signal**
-  (did the user build on the work, or correct/redo it?)
+外加:
 
-Backends (auto-fallback): `claude` CLI · Anthropic API · OpenAI-compat
-`/chat/completions`.
+- **strict-public 发布审查** —— 用户点「发布到 community」时跑,**检测就 reject 不替换**:
+  `file://` URI、`vscode-resource://`、私有 IP、绝对路径、session UUID 等会指纹
+  机器的内容,任何一条命中 publish 就被阻止。
+- **凭据 `~/.experience-pool/credentials/*.json`** 是 0600,**不离开本机**。
+- **`session-extractor/` 硬编码 `acl=private`**,无法绕过 —— 批量回填只能传到本人 private。
+- **每条 session 默认上限 4 MB**(`--max-session-kb 4096`),回填时可放宽。
 
-## Privacy posture
+`tool_calls[].input` 是嵌套结构,客户端 / 服务端都**递归**进每个字符串叶子,
+不会被 nesting 蒙混。
 
-- Client-side regex sweep before upload: Anthropic / OpenAI / Stripe / GitHub /
-  AWS keys, URL credentials, email, IPv4
-- Portal bind mode writes a per-user HMAC credential locally and never embeds
-  real secrets in this repository
-- `session-extractor/` is private-only by design: its upload body always uses
-  `acl=private`
-- ACL is per-experience: `private` | `team:<name>` | `public` (default
-  `private` for the auto-uploader; override with `EXP_AUTO_ACL`)
-- Per-source toggle: `EXP_AUTO_SOURCES=claude-code,hermes,...`
-- Daemon caps per-session size at 4 MB by default
-- HMAC secret stored 0600 at `~/.experience-pool/credentials/<name>.json` and
-  never leaves this machine
+## 任务结束自动打标题(零成本)
 
-## Self-labeling (zero-cost per-task labels)
+一个 session 通常包含多个独立子任务。上传时按主题切片,**每段都需要自己的标题**——
+session 结束时一个标记只能覆盖最后一段。
 
-A session often contains multiple distinct tasks. The uploader segments
-the trajectory by topic-shift, so EACH segment needs its own label — a
-single end-of-session marker would only cover the last segment.
+**每完成一个子任务,在收尾的助手回复尾部加一行**(不只是 session 结束):
 
-**Emit `[task-summary]: <label>` at the end of every completed sub-task**,
-in the wrapping-up assistant response, not only at session end.
+```text
+[task-summary]: <动词 + 对象,≤80 char>
+```
 
-When to emit:
-- You just finished a cohesive sub-task (delivered the answer / code /
-  fix the user asked for) and the user is about to move on
-- The user's next message switches topic — emit in your previous response
-- Session is ending — final safeguard
+什么时候打:
 
-Format (single line at end of response):
+- 你刚刚交付完一个有头有尾的子任务(给出答案 / 写完代码 / 修好 bug),用户即将转向下一件事
+- 用户的下一条消息切换主题 → 你应该在**前一条**回复就打上
+- session 即将结束 → 最后保险
 
-    [task-summary]: <action-oriented one-line label, max 80 chars>
+格式规则:
 
-Examples:
+- 动词 + 对象,≤80 char
+- 匹配用户语言(中文用户用中文,英文用户用英文)
+- 描述**做完了什么**,不要复述用户字面问题
+- 单行,无引号,无句末标点
+- 纯打招呼 / 澄清没产出的可以跳过
 
-    [task-summary]: 排查并修复 Caddy ACME 80 端口防火墙阻塞
-    [task-summary]: Translate project README from Chinese to English
-    [task-summary]: 上传机械振动作业到 Canvas
+例:
 
-Rules:
-- Verb + object, max 80 characters
-- Match user's primary language
-- Describe what was accomplished, NOT the user's first literal message
-- One line, no quotes, no trailing period
-- Skip only for pure greetings / clarifications with no real outcome
+```text
+[task-summary]: 排查并修复 Caddy ACME 80 端口防火墙阻塞
+[task-summary]: Translate project README from Chinese to English
+[task-summary]: 上传机械振动作业到 Canvas
+```
 
-Each marker is parsed by `_extract_agent_summary()` and becomes that
-segment's `intent`. Costs zero extra inference (it's part of the response
-you were already producing).
+每个 marker 被 `_extract_task_summary_title()` 解析成那段的 `intent`。**不耗任何额外推理**。
+没打的话,服务端会:
 
-## Output discipline
+1. 在 push 后**后台跑**一次本地 `claude -p` 总结整段对话(`title_refine` 模块)
+2. 还是不行就回退到第一条真实用户消息的第一句
 
-When this skill is invoked, do not paste raw `exp ...` JSON into the
-user-facing reply. Summarize: which prior experience was reused, why it
-matched, and which steps were adapted.
+服务端的 title 改写在每次 push 后自动跑,不阻塞响应。
+
+## 输出风格
+
+skill 被调用时,**不要把 `exp ...` 的原始 JSON 贴给用户**。要总结:复用了哪条经验、
+为什么匹配、适配了哪几步。让用户感知到「pool 起作用了」,而不是看到一堆调试输出。
+
+## Agent 契约分发位置
+
+`install.sh` 检测到本机 agent runtime 后,把 `agent-contract.md` 写到对应位置:
+
+| Runtime | 写到哪 |
+|---|---|
+| Claude Code | `~/.claude/skills/experience-pool/SKILL.md`(自动加载) |
+| Cursor | `~/.cursor/rules/experience-pool.md`(全局规则) |
+| Codex | `~/.codex/AGENTS.md`(append,不覆盖用户自定义) |
+| Hermes / OpenClaw | `~/.<runtime>/skills/experience-pool/SKILL.md` + `~/.<runtime>/AGENTS.md` |
+| 其它 | `~/.experience-pool/agent-contract-<name>.md`(操作员手动 wire) |
+
+不同 runtime 看到**同一份**契约,行为统一。
+
+## 排错速查
+
+| 现象 | 看哪 |
+|---|---|
+| `exp whoami` 报 no credential | 没 bind / `EXP_AGENT_NAME` 错了 |
+| `401 bad signature` | secret 跟 server 不匹配 / body 字节被 shell 二次转义 |
+| 标题成 `<transcript>` 或 conversational 整段 | `docs/UPLOAD_LOGIC_AND_MANUAL.md` §5、§9 |
+| 上传量异常翻倍 | LLM 子进程触发 SessionEnd 递归,看 §9 |
+| row 永远 `layer1_only`,`strict_redactions` 永远空 | OPF backfill worker 没启动,见 `docs/SANITIZATION.md` §2 |
+| 撤回后再传被指纹挡住 | `DELETE FROM content_fingerprints WHERE experience_id=?` |
+| `/me` 看不全 | 翻页 `?page=2` |
+| Next.js proxy 下 404 | `EXP_UI_PUBLIC_URL` 没设,重 build |
 
 ## Self-host
 
-The reference Experience Pool gateway is FastAPI + SQLite + Caddy, fits in
-4 GB RAM, runs from `docker compose -f deploy/docker-compose.prod.yml up -d`.
-Point the skill at your own gateway by exporting `EXP_BASE_URL=...` before
-running install.sh. Source: see homepage link above.
+参考实现:FastAPI + SQLite + Caddy / Next.js gateway,4 GB RAM 够。当前内网部署在
+`10.244.66.195`(API + UI)+ `10.245.4.167`(OPF GPU)两台机器。源码在 git 仓库,
+见 homepage。
