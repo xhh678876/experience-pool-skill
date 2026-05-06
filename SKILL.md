@@ -3,7 +3,7 @@ name: experience-pool
 description: 创智内网共享经验池接入 skill。每次任务结束自动把会话轨迹脱敏后归档到本人 private 库;开始新任务前可先 search 同类问题的关键步骤。支持 Claude Code / Cursor / Codex / Hermes / OpenClaw / agents-chat,以及任意 OpenAI / Anthropic 形状的 messages JSON。HMAC 签名 + per-user ACL,默认 private。
 version: 0.5.0
 license: MIT
-homepage: http://10.244.66.195:3080
+homepage: https://github.com/xhh678876/experience-pool-skill
 triggers:
   - 上传经验
   - 共享经验
@@ -22,9 +22,9 @@ triggers:
 
 | 用途 | 地址 |
 |---|---|
-| Gateway / 入口 | `http://10.244.66.195:3080` |
-| 门户(注册 / 登录 / `/me`) | `http://10.244.66.195:3080/login` |
-| FastAPI(只内网) | `http://10.244.66.195:8081` |
+| Gateway / 入口 | `<EXP_BASE_URL>` |
+| 门户(注册 / 登录 / `/me`) | `<EXP_BASE_URL>/login` |
+| FastAPI(只内网) | `<EXP_BASE_URL>` |
 | OPF 深度脱敏(独立 GPU) | `http://10.245.4.167:8085` |
 
 ## 文档导航
@@ -35,15 +35,15 @@ triggers:
 
 ## 第一次用(本机首次接入)
 
-1. 浏览器打开 `http://10.244.66.195:3080/login`,用 `xxx@sii.edu.cn` 邮箱注册 / 登录
+1. 浏览器打开 `<EXP_BASE_URL>/login`,用 `xxx@sii.edu.cn` 邮箱注册 / 登录
 2. 进 `/me` 页,复制「绑定本机」面板的 curl 一行
 3. 终端粘贴:
 
 ```bash
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_AGENT_NAME='user-xxx' \
   EXP_AGENT_SECRET='<portal-issued-secret>' \
-  EXP_BASE_URL='http://10.244.66.195:3080' \
+  EXP_BASE_URL='<EXP_BASE_URL>' \
   bash
 ```
 
@@ -214,5 +214,6 @@ skill 被调用时,**不要把 `exp ...` 的原始 JSON 贴给用户**。要总�
 ## Self-host
 
 参考实现:FastAPI + SQLite + Caddy / Next.js gateway,4 GB RAM 够。当前内网部署在
-`10.244.66.195`(API + UI)+ `10.245.4.167`(OPF GPU)两台机器。源码在 git 仓库,
+主 API + UI pod(对外用 sii vscode notebook proxy 暴露 3080)+ 独立 OPF GPU
+机器(`10.245.4.167:8085`)两台。源码在 git 仓库,
 见 homepage。

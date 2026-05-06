@@ -9,27 +9,44 @@
 
 ## 内网当前部署
 
-| 用途 | 地址 |
+服务端入口是一条 sii vscode notebook proxy URL:
+
+```
+<EXP_BASE_URL> = https://nat2-notebook-inspire.sii.edu.cn/.../proxy/3080
+```
+
+完整 URL 在 portal `/me` 页拿(自动包含你的 ws / project / user / vscode 各 id)。
+这一个 URL 同时承载:
+
+| Path | 功能 |
 |---|---|
-| Gateway / 入口(对外) | `http://10.244.66.195:3080` |
-| 门户(`/login` / `/register` / `/me`) | `http://10.244.66.195:3080/login` |
-| FastAPI(只内网) | `http://10.244.66.195:8081` |
-| OPF 深度脱敏(独立 GPU) | `http://10.245.4.167:8085` |
+| `<EXP_BASE_URL>/login` / `/register` / `/me` | 门户网页 |
+| `<EXP_BASE_URL>/install` / `/exp_uploader.py` | bootstrap 静态文件 |
+| `<EXP_BASE_URL>/v1/*` | FastAPI(HMAC 验证) |
+| `<EXP_BASE_URL>/session-extractor/run.sh` | 零依赖批量回填工具 |
+
+OPF 深度脱敏是独立 GPU 机器(`http://10.245.4.167:8085`),只服务端调,下游不用关心。
+
+⚠️ **绝对不要用 pod IP**(`10.244.x.y:3080`):k8s 内部地址,跨 pod 不通。
+永远用 portal `/me` 给你的那条 proxy URL。
 
 ## 一行装好
 
-正确路径:先在 `/me` 复制 bind 命令,然后:
+**完整命令直接在 portal `/me` 页拷贝**(包含你的 agent name + secret + 正确的
+proxy URL,粘进终端就能跑)。
+
+形如:
 
 ```bash
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_AGENT_NAME='user-xxx' \
   EXP_AGENT_SECRET='<portal-issued-secret>' \
-  EXP_BASE_URL='http://10.244.66.195:3080' \
+  EXP_BASE_URL='<EXP_BASE_URL>' \
   bash
 ```
 
-(没账号:`http://10.244.66.195:3080/register` 用 `xxx@sii.edu.cn` 邮箱注册,然后到
-`/me` 拿 secret。)
+没账号:打开 `<EXP_BASE_URL>/register`,用 `xxx@sii.edu.cn` 邮箱注册,
+然后到 `/me` 拿 secret。
 
 ## 这套 skill 由 5 部分组成
 
@@ -60,7 +77,7 @@ curl -sSL http://10.244.66.195:3080/install | \
    ▼                                         └────────────┬────────────┘
 adapter 拆 block + 客户端 L0 正则脱敏                       │
    │                                                       ▼
-   └── HMAC-SHA256 POST /v1/lite/push ──► http://10.244.66.195:3080
+   └── HMAC-SHA256 POST /v1/lite/push ──► <EXP_BASE_URL>
                                                           │
    可选:exp_annotator 切 (user, assistant)               ▼
    + 后续 K turn,提交 5 维 reward 到                FastAPI(8081)
@@ -93,26 +110,26 @@ adapter 拆 block + 客户端 L0 正则脱敏                       │
 
 ```bash
 # 默认(auto-sync 开,acl=private,daemon 120s)
-curl -sSL http://10.244.66.195:3080/install | bash
+curl -sSL <EXP_BASE_URL>/install | bash
 
 # 指定 agent 名(共享机器推荐)
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_AGENT_NAME=alice EXP_TEAM=platform bash
 
 # 关掉所有自动同步,只装 CLI
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_SKIP_HOOK=1 EXP_SKIP_DAEMON=1 bash
 
 # 限定 auto-sync 的 source
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_AUTO_SOURCES=claude-code,hermes bash
 
 # 改默认 ACL
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_AUTO_ACL=team:platform bash
 
 # 装好就批量回填本机历史
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_BACKFILL=1 bash
 ```
 
@@ -136,10 +153,10 @@ exp annotate-existing                     # 用别的模型重新评分
 `exp` CLI:
 
 ```bash
-curl -fsSL http://10.244.66.195:3080/session-extractor/run.sh | \
+curl -fsSL <EXP_BASE_URL>/session-extractor/run.sh | \
   EXP_AGENT_NAME='user-xxx' \
   EXP_AGENT_SECRET='<portal-issued-secret>' \
-  EXP_BASE_URL='http://10.244.66.195:3080' \
+  EXP_BASE_URL='<EXP_BASE_URL>' \
   EXP_EXTRACTOR_FLAGS='--max-mb 0 --sleep 0 --verbose' \
   bash
 ```

@@ -7,7 +7,7 @@
 # Required env (the /me page bakes them into the copy-paste command):
 #   EXP_AGENT_NAME    your agent name (e.g., user-xhh666)
 #   EXP_AGENT_SECRET  your HMAC secret
-#   EXP_BASE_URL      experience-pool API base (e.g., http://10.244.66.195:3080)
+#   EXP_BASE_URL      experience-pool API base (e.g., https://nat2-notebook-inspire.sii.edu.cn/ws-0349f1f3-e433-45b7-a935-1dd1bfaf8f6b/project-969649d6-31b8-45af-b6ff-ffb85bbfb3c9/user-ef4936dd-0231-4485-ba30-34e92bf3ea53/vscode/6bf937f8-4826-43cd-b0f6-54f30c688f96/a5119654-19ab-4e0d-9527-bb73a246b9a8/proxy/3080)
 #
 # Optional:
 #   EXP_EXTRACTOR_DIR  where to write the extractor (default: ~/.experience-pool/extractor)

@@ -14,10 +14,10 @@ session,批量上传到内网经验池的本人 **private** 库。模仿 `claude
 门户 `/me` 页面有一行带好你 secret 的命令,大约这样:
 
 ```bash
-curl -fsSL http://10.244.66.195:3080/session-extractor/run.sh | \
+curl -fsSL <EXP_BASE_URL>/session-extractor/run.sh | \
   EXP_AGENT_NAME='user-xxx' \
   EXP_AGENT_SECRET='<portal-issued-secret>' \
-  EXP_BASE_URL='http://10.244.66.195:3080' \
+  EXP_BASE_URL='<EXP_BASE_URL>' \
   bash
 ```
 
@@ -39,7 +39,7 @@ curl -fsSL http://10.244.66.195:3080/session-extractor/run.sh | \
 ```bash
 EXP_AGENT_NAME='user-xxx' \
 EXP_AGENT_SECRET='<hex>' \
-EXP_BASE_URL='http://10.244.66.195:3080' \
+EXP_BASE_URL='<EXP_BASE_URL>' \
 python3 extract_and_upload.py [options]
 ```
 
@@ -65,7 +65,7 @@ EXP_EXTRACTOR_FLAGS='--max-mb 0 --sleep 0 --verbose'
 
 ```text
 [extractor] sources: claude-code, codex
-[extractor] target:  http://10.244.66.195:3080  agent=user-xxx
+[extractor] target:  <EXP_BASE_URL>  agent=user-xxx
 [extractor] acl:     private (never public — by design)
 
 [claude-code] found 21 session file(s)

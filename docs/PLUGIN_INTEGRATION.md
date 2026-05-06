@@ -3,8 +3,11 @@
 写一个 Claude Code skill / Cursor command / 任意 agent 的"经验池查询"插件,
 你需要的全部接口都在这。
 
-> 服务端入口: `http://10.244.66.195:3080`(内网) 或 portal `/me` 给的 vscode
-> proxy URL(其它内网电脑必须用 proxy URL,见 `docs/UPLOAD_LOGIC_AND_MANUAL.md` §4)
+> **服务端入口** = portal `/me` 页给你的 vscode notebook proxy URL,
+> 形如 `https://nat2-notebook-inspire.sii.edu.cn/.../proxy/3080`。
+>
+> 下文统称 `<EXP_BASE_URL>`,在你机器上是 `~/.experience-pool/credentials/<name>.json`
+> 里的 `base_url` 字段。**绝对不要**用 pod IP `10.244.x.y:3080` —— 跨 pod 不通。
 
 ---
 
@@ -287,7 +290,7 @@ spec.loader.exec_module(exp)
 # 可用的 helper
 cred = exp.load_credential()                   # 读 ~/.experience-pool/credentials/...
 res  = exp.http_request(
-    base_url="http://10.244.66.195:3080",
+    base_url="<EXP_BASE_URL>",
     method="POST",
     path="/v1/lite/search",
     body={"q": "...", "top_k": 5, "scope": "auto"},
@@ -389,7 +392,7 @@ description: ...
 ## 8. 关于 vscode notebook proxy URL
 
 如果你的插件运行在「**不同于经验池 pod 的内网机器**」上,
-**不能用** `http://10.244.66.195:3080`(那是 k8s pod IP, 跨 pod 不通)。
+**不能用** `<EXP_BASE_URL>`(那是 k8s pod IP, 跨 pod 不通)。
 必须用 portal `/me` 上发的 proxy URL,大约长这样:
 
 ```

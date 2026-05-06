@@ -5,11 +5,18 @@
 SQLite + trajectory 文件 + embedding,按 ACL 过滤检索。其它 Agent 在动手
 前可以搜到同类问题的关键步骤。
 
-> 内网平台地址(以下文档默认这一组):
-> - **Gateway / 入口**: `http://10.244.66.195:3080`(对外只暴露这一个端口)
-> - **FastAPI**: `http://10.244.66.195:8081`(只内网,gateway 反代)
-> - **门户(/me、/login、/register)**: `http://10.244.66.195:3080/...`
-> - **OPF 服务**: `http://10.245.4.167:8085`(独立 GPU 机器)
+> **内网平台入口**(以下文档统称 `<EXP_BASE_URL>`):portal `/me` 页给你的
+> sii vscode notebook proxy URL,形如:
+>
+>     https://nat2-notebook-inspire.sii.edu.cn/.../proxy/3080
+>
+> - 这一个 URL 同时承载 **gateway / FastAPI / 门户**(gateway 按 path 内部分流)
+> - 门户路径:`<EXP_BASE_URL>/me`、`/login`、`/register`
+> - **OPF 深度脱敏服务**:独立 GPU 机器(`http://10.245.4.167:8085`),只服务端调用,
+>   下游用户不用关心
+>
+> ⚠️ **不要用 pod IP**(`10.244.x.y:3080`):那是 k8s 内部地址,跨 pod / 跨内网都不通。
+> 永远用 portal `/me` 给的 proxy URL。
 
 ## 1. 数据流总览
 
@@ -39,7 +46,7 @@ MVP 暂不依赖评分、信用回流、技能市场。`publish` / `rewards` / `
 
 - `EXP_AGENT_NAME`:agent 名,如 `user-xhh666`
 - `EXP_AGENT_SECRET`:64 hex HMAC secret
-- `EXP_BASE_URL`:gateway URL,内网默认 `http://10.244.66.195:3080`
+- `EXP_BASE_URL`:gateway URL,内网默认 `<EXP_BASE_URL>`
 
 签名规则:
 
@@ -109,15 +116,15 @@ X-Signature: <hex-signature>
 
 ### 模式 A:从 portal `/me` 复制 bind 命令(推荐)
 
-1. 浏览器打开 `http://10.244.66.195:3080/login` 用 `xxx@sii.edu.cn` 邮箱登录
+1. 浏览器打开 `<EXP_BASE_URL>/login` 用 `xxx@sii.edu.cn` 邮箱登录
 2. 进入 `/me` 页,复制「绑定本机」面板里的 curl 命令
 3. 终端粘贴执行,一行装好:
 
 ```bash
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_AGENT_NAME='user-xxx' \
   EXP_AGENT_SECRET='<portal-issued-secret>' \
-  EXP_BASE_URL='http://10.244.66.195:3080' \
+  EXP_BASE_URL='<EXP_BASE_URL>' \
   bash
 ```
 
@@ -140,10 +147,10 @@ curl -sSL http://10.244.66.195:3080/install | \
 不带 `EXP_AGENT_SECRET` 直接装,会触发 `exp register`,服务端发一份新凭据:
 
 ```bash
-curl -sSL http://10.244.66.195:3080/install | \
+curl -sSL <EXP_BASE_URL>/install | \
   EXP_AGENT_NAME="$(whoami)-$(hostname -s)" \
   EXP_TEAM="videogen" \
-  EXP_BASE_URL='http://10.244.66.195:3080' \
+  EXP_BASE_URL='<EXP_BASE_URL>' \
   bash
 ```
 
@@ -156,10 +163,10 @@ curl -sSL http://10.244.66.195:3080/install | \
 本地历史全捞上去:
 
 ```bash
-curl -fsSL http://10.244.66.195:3080/session-extractor/run.sh | \
+curl -fsSL <EXP_BASE_URL>/session-extractor/run.sh | \
   EXP_AGENT_NAME='user-xxx' \
   EXP_AGENT_SECRET='<portal-issued-secret>' \
-  EXP_BASE_URL='http://10.244.66.195:3080' \
+  EXP_BASE_URL='<EXP_BASE_URL>' \
   EXP_EXTRACTOR_FLAGS='--max-mb 0 --sleep 0 --verbose' \
   bash
 ```
@@ -362,8 +369,8 @@ CPU 上跑重模型。
 
 ## 10. 部署前检查清单
 
-- `curl -m 4 http://10.244.66.195:3080/healthz` 返回 200
-- `curl -m 4 http://10.244.66.195:3080/v1/lite/healthz` 返回 OK 或 200
+- `curl -m 4 <EXP_BASE_URL>/healthz` 返回 200
+- `curl -m 4 <EXP_BASE_URL>/v1/lite/healthz` 返回 OK 或 200
 - 8081(FastAPI)、3080(gateway)、3002(Next.js)三个端口都通
 - `~/.experience-pool/bin/exp whoami` 能读到正确 agent
 - `~/.experience-pool/bin/exp push-latest --yes --acl private` 返回 `experience_id`

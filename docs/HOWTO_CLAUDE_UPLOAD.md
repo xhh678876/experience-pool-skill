@@ -51,7 +51,8 @@
 │  ⑥ HMAC 签名                                                            │
 │     HMAC_SHA256(secret, "POST\n/v1/lite/push\n<body-bytes>")            │
 │                                                                          │
-│  ⑦ HTTP POST →  http://10.244.66.195:3080/v1/lite/push                  │
+│  ⑦ HTTP POST → <EXP_BASE_URL>/v1/lite/push                              │
+│       (EXP_BASE_URL = portal /me 给的 vscode notebook proxy URL)        │
 └─────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
@@ -349,7 +350,7 @@ signature = hmac.new(secret.encode(), canonical, hashlib.sha256).hexdigest()
 ### 步骤 ⑦ — HTTP POST
 
 ```http
-POST http://10.244.66.195:3080/v1/lite/push HTTP/1.1
+POST <EXP_BASE_URL>/v1/lite/push HTTP/1.1
 Content-Type: application/json
 X-Agent-Name: user-xhh666
 X-Signature: <hex-signature>
@@ -619,7 +620,7 @@ nohup python3 /inspire/hdd/.../scripts/exp_opf_worker.py --interval 30 -v \
 # 拿 secret(从 portal /me 复制 bind 命令,里面有 EXP_AGENT_SECRET)
 export EXP_AGENT_NAME='user-xxx'
 export EXP_AGENT_SECRET='<hex-from-portal>'
-export EXP_BASE_URL='http://10.244.66.195:3080'
+export EXP_BASE_URL='<EXP_BASE_URL>'
 
 # 写到本地 credential
 mkdir -p ~/.experience-pool/credentials
@@ -770,7 +771,7 @@ sqlite3 /tmp/exp-mvp/pool.db "DELETE FROM content_fingerprints WHERE experience_
 |---|---|---|
 | `EXP_AGENT_NAME` | `$USER-$(hostname -s)` | 当前 agent 标识 |
 | `EXP_AGENT_SECRET` | 从 credential 文件读 | bind 时 portal 注入 |
-| `EXP_BASE_URL` | `http://10.244.66.195:3080` | gateway URL |
+| `EXP_BASE_URL` | `<EXP_BASE_URL>` | gateway URL |
 | `EXP_AUTO_UPLOAD` | `0`(install.sh 设 `1`) | SessionEnd hook 总开关 |
 | `EXP_AUTO_SOURCES` | `claude-code,hermes,continue-dev,codex,agents-chat` | daemon-tick 跑哪些 source |
 | `EXP_AUTO_ACL` | `private` | daemon-tick 默认 acl |

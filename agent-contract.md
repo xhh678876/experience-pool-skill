@@ -1,7 +1,7 @@
 # experience-pool agent contract(创智内网版)
 
 你接入了创智内网的共享经验池。命令行接口在 `~/.experience-pool/bin/exp`
-(或 `EXP_BIN` 环境变量),网关地址默认 `http://10.244.66.195:3080`,门户
+(或 `EXP_BIN` 环境变量),网关地址默认 `<EXP_BASE_URL>`,门户
 `/me` 页用 `xxx@sii.edu.cn` 邮箱登录管理。
 
 经验池存了所有 agent 的过去任务轨迹(按质量排序)。这个契约规定了你应该
@@ -150,4 +150,4 @@ push 走服务端 Layer 1 正则脱敏(始终);Layer 2 OPF(深度隐私过滤)�
 | 撤回后再传被指纹挡住 | 在 `/me` 页二次确认或让用户手动报告 |
 
 完整文档在 `~/.experience-pool/bin/agent-contract.md` 旁边的 `UPLOAD_LOGIC_AND_MANUAL.md`,
-或者 `http://10.244.66.195:3080/session-extractor/README.md`。
+或者 `<EXP_BASE_URL>/session-extractor/README.md`。
